@@ -21,6 +21,43 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 from einops import rearrange
 from torch import einsum
 
+class LoraLayer(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dim: int,
+        column_init_method: str = 'xavier',  # TODO: (@adithyare) should rename this to input_init_method to be more precise.
+        row_init_method: str = 'zero',  # TODO: (@adithyare) should rename this to output_init_method to be more precise.
+    ):
+        super().__init__()
+
+        self.linear_in = ColumnParallelLinear(
+            in_features, dim, bias=False, gather_output=True, init_method=self._get_init_fn(column_init_method)
+        )
+        self.linear_out = ColumnParallelLinear(
+            dim, out_features, bias=False, gather_output=False, init_method=self._get_init_fn(row_init_method)
+        )
+
+    def _get_init_fn(self, init_method: str):
+        if init_method == 'xavier':
+            init_fn = init.xavier_normal_
+        elif init_method == 'normal':
+            init_fn = init_method_normal(0.2)
+        elif init_method == "zero":
+            init_fn = init_method_const(0.0)
+        else:
+            raise NotImplementedError("out_init_method should be zero, normal or xavier")
+        return init_fn
+
+    def forward(self, x):
+
+        x, _ = self.linear_in(x)  
+        x, _ = self.linear_out(x)
+
+        return x
+
+
 _shape_t = Union[int, List[int], Size]
 class NVGPTLayerNorm1P(torch.nn.LayerNorm):
     __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
@@ -99,6 +136,10 @@ class NVGPTAttention(torch.nn.Module):
                                            self.hidden_size_per_attention_head,
                                            self.scaling,
                                            rotary_dim=rotary_dim)
+        
+        
+        self.lora_layer = LoraLayer(in_features=self.hidden_size, 
+                                    out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=32)
                 
     def forward(
         self,
@@ -109,6 +150,8 @@ class NVGPTAttention(torch.nn.Module):
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)        
+        lora_qkv, _ = self.lora_layer(hidden_states)
+        qkv = qkv + lora_qkv
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         q, k, v = torch.chunk(qkv, 3, dim=-1)          
@@ -226,7 +269,7 @@ class NVGPTForCausalLM(torch.nn.Module):
                                    input_metadata)
         return next_tokens
 
-    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight"]
+    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight"]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
 
     def load_weights(self,
@@ -253,12 +296,15 @@ class NVGPTForCausalLM(torch.nn.Module):
                 loaded_weight = loaded_weight.view(2, tensor_model_parallel_world_size, -1, din)
                 loaded_weight = loaded_weight.transpose(0,1)
                 loaded_weight = loaded_weight.reshape(dout, din)
-              
-            if "query_key_value" in name:
+            
+            if "query_key_value" in name or "lora_layer.linear_out" in name:
                 # NVGPT's fused QKV has the shape of
                 # [num_heads * 3 * head_size, hidden_size], while the
                 # required shape is [3 * num_heads * head_size, hidden_size].
                 # Thus, we need weight conversion.
+
+                # in the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
+                #
 
                 shard_size = param.shape[0]
                 start = shard_size * tensor_model_parallel_rank

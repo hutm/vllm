@@ -1,5 +1,4 @@
 from typing import Dict, List, Optional, Tuple, Union
-
 import torch
 from torch import nn
 from transformers import NVGPTConfig
@@ -31,7 +30,6 @@ class LoraLayer(nn.Module):
         row_init_method: str = 'zero',  # TODO: (@adithyare) should rename this to output_init_method to be more precise.
     ):
         super().__init__()
-
         self.linear_in = ColumnParallelLinear(
             in_features, dim, bias=False, gather_output=True, init_method=self._get_init_fn(column_init_method)
         )
@@ -51,12 +49,9 @@ class LoraLayer(nn.Module):
         return init_fn
 
     def forward(self, x):
-
         x, _ = self.linear_in(x)  
         x, _ = self.linear_out(x)
-
         return x
-
 
 _shape_t = Union[int, List[int], Size]
 class NVGPTLayerNorm1P(torch.nn.LayerNorm):
@@ -64,7 +59,6 @@ class NVGPTLayerNorm1P(torch.nn.LayerNorm):
     normalized_shape: Tuple[int, ...]
     eps: float
     elementwise_affine: bool
-
     def __init__(self, normalized_shape: _shape_t, eps: float = 1e-5, elementwise_affine: bool = True,
                  device=None, dtype=None) -> None:
         
@@ -93,7 +87,6 @@ class NVGPTMLP(torch.nn.Module):
         return x
 
 class NVGPTAttention(torch.nn.Module):
-
     def __init__(
         self,
         config: NVGPTConfig,
@@ -137,7 +130,6 @@ class NVGPTAttention(torch.nn.Module):
                                            self.scaling,
                                            rotary_dim=rotary_dim)
         
-        
         self.lora_layer = LoraLayer(in_features=self.hidden_size, 
                                     out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=32)
                 
@@ -162,7 +154,6 @@ class NVGPTAttention(torch.nn.Module):
         return output
 
 class NVGPTDecoderLayer(torch.nn.Module):
-
     def __init__(self, config: NVGPTConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -200,7 +191,6 @@ class NVGPTDecoderLayer(torch.nn.Module):
         return hidden_states
     
 class NVGPTModel(torch.nn.Module):
-
     def __init__(self, config: NVGPTConfig):
         super().__init__()
         self.config = config
@@ -226,7 +216,6 @@ class NVGPTModel(torch.nn.Module):
     ) -> torch.Tensor:      
         hidden_states = self.embedding(input_ids)
         for i in range(len(self.layers)):
-
             if cache_events is None:
                 cache_event = None
             else:
@@ -243,7 +232,6 @@ class NVGPTModel(torch.nn.Module):
         return hidden_states
 
 class NVGPTForCausalLM(torch.nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -271,7 +259,6 @@ class NVGPTForCausalLM(torch.nn.Module):
 
     _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight"]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
-
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
@@ -302,10 +289,7 @@ class NVGPTForCausalLM(torch.nn.Module):
                 # [num_heads * 3 * head_size, hidden_size], while the
                 # required shape is [3 * num_heads * head_size, hidden_size].
                 # Thus, we need weight conversion.
-
-                # in the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
-                #
-
+                # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
                 shard_size = param.shape[0]
                 start = shard_size * tensor_model_parallel_rank
                 end = shard_size * (tensor_model_parallel_rank + 1)

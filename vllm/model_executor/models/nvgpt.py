@@ -15,10 +15,18 @@ from vllm.model_executor.parallel_utils.tensor_parallel import (
     VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
 from vllm.sequence import SequenceOutputs
 
+from torch.nn import init
+
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 from einops import rearrange
 from torch import einsum
+
+def init_method_const(val):
+    def init_(tensor):
+        return torch.nn.init.constant_(tensor, val)
+
+    return init_
 
 class LoraLayer(nn.Module):
     def __init__(
@@ -31,10 +39,10 @@ class LoraLayer(nn.Module):
     ):
         super().__init__()
         self.linear_in = ColumnParallelLinear(
-            in_features, dim, bias=False, gather_output=True, init_method=self._get_init_fn(column_init_method)
+            in_features, dim, bias=False, gather_output=True, init_method=self._get_init_fn("xavier")
         )
         self.linear_out = ColumnParallelLinear(
-            dim, out_features, bias=False, gather_output=False, init_method=self._get_init_fn(row_init_method)
+            dim, out_features, bias=False, gather_output=False, init_method=self._get_init_fn("zero")
         )
 
     def _get_init_fn(self, init_method: str):
@@ -51,7 +59,7 @@ class LoraLayer(nn.Module):
     def forward(self, x):
         x, _ = self.linear_in(x)  
         x, _ = self.linear_out(x)
-        return x
+        return x, None
 
 _shape_t = Union[int, List[int], Size]
 class NVGPTLayerNorm1P(torch.nn.LayerNorm):
@@ -257,8 +265,46 @@ class NVGPTForCausalLM(torch.nn.Module):
                                    input_metadata)
         return next_tokens
 
-    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight"]
+    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight", "lora_layer.linear_out.weight"]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
+
+
+    def map_name(self, name):
+        return name.replace('model.language_model.encoder.', 'model.').replace("adapter_layer.lora_kqv_adapter.", "lora_layer.")
+
+    def load_lora_weights(self, lora_path: str):
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
+        state_dict = self.state_dict()
+        for nemo_name, loaded_weight in torch.load(lora_path, map_location="cpu").items():
+            name = self.map_name(nemo_name)
+            param = state_dict[name]
+            print(name, loaded_weight.shape, param.shape)
+
+            #if "lora_layer.linear_out" in name:
+            #    # NVGPT's fused QKV has the shape of
+            #    # [num_heads * 3 * head_size, hidden_size], while the
+            #    # required shape is [3 * num_heads * head_size, hidden_size].
+            #    # Thus, we need weight conversion.
+            #    # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
+            #    shard_size = param.shape[0]
+            #    start = shard_size * tensor_model_parallel_rank
+            #    end = shard_size * (tensor_model_parallel_rank + 1)
+            #    loaded_weight = loaded_weight[start:end]
+
+            #    num_heads = self.config.num_attention_heads
+            #    hidden_size = self.config.hidden_size
+            #    head_size = hidden_size // num_heads
+
+            #    loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
+            #    loaded_weight = loaded_weight.transpose(0, 1)
+            #    loaded_weight = loaded_weight.reshape(-1, hidden_size)                  
+
+            load_tensor_parallel_weights(param, loaded_weight, name,
+                                         self._column_parallel_weights,
+                                         self._row_parallel_weights,
+                                         tensor_model_parallel_rank)
+            
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
@@ -284,7 +330,7 @@ class NVGPTForCausalLM(torch.nn.Module):
                 loaded_weight = loaded_weight.transpose(0,1)
                 loaded_weight = loaded_weight.reshape(dout, din)
             
-            if "query_key_value" in name or "lora_layer.linear_out" in name:
+            if "query_key_value" in name: #or "lora_layer.linear_out" in name:
                 # NVGPT's fused QKV has the shape of
                 # [num_heads * 3 * head_size, hidden_size], while the
                 # required shape is [3 * num_heads * head_size, hidden_size].

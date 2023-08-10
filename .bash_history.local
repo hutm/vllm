@@ -1,0 +1,93 @@
+2023-07-28:11:56  2001  cd vllm/
+2023-07-28:11:56  2002  #
+2023-07-28:11:56  2003  #docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/pytorch:22.12-py3
+2023-07-28:11:57  2000  cd vllm/
+2023-07-28:11:57  2001  ls
+2023-07-28:11:57  1999  ssh_selene 
+2023-07-28:12:07  2004  docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/pytorch:22.12-py3
+2023-07-28:12:10  2004  docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/pytorch:22.12-py3
+2023-07-28:12:11  2005  nvidia-smi
+2023-07-28:12:11  2005  nvidia-smi
+2023-07-28:12:14  2000  cd vllm/
+2023-07-28:12:14  2001  nvidia-smi
+2023-07-28:12:16  2001  nvidia-smi
+2023-07-28:12:16  2001  nvidia-smi
+2023-07-28:12:20  2000  cd vllm/
+2023-07-28:12:20  2001  ls
+2023-07-28:12:20  2002  git log
+2023-07-28:12:20  2002  git log
+2023-07-28:12:20  2002  git log
+2023-07-28:12:20  2003  git branch
+2023-07-28:12:20  2003  git branch
+2023-07-28:12:20  2003  git branch
+2023-07-28:12:20  2003  git branch
+2023-07-28:12:20  2003  git branch
+2023-07-28:12:32  1999  conda list
+2023-07-28:12:32  2000  ls
+2023-07-28:12:41  2001  git branch
+2023-07-28:12:41  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:12:41  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2002  git checkout -b adithyare/lora_nvgpt
+2023-07-28:13:00  2003  git status
+2023-07-28:13:01  2004  git diff vllm/model_executor/models/nvgpt.py
+2023-07-28:13:01  2004  git diff vllm/model_executor/models/nvgpt.py
+2023-07-28:13:01  2004  git diff vllm/model_executor/models/nvgpt.py
+2023-07-28:13:01  2005  git status
+2023-07-28:13:01  2006  git add vllm/model_executor/models/nvgpt.py 
+2023-07-28:13:02  2007  git commit -s -m " base code for lora in nvgpt"
+2023-07-28:13:02  2008  git push -u origin adithyare/lora_nvgpt
+2023-07-28:13:02  2008  git push -u origin adithyare/lora_nvgpt
+2023-07-28:13:02  2008  git push -u origin adithyare/lora_nvgpt
+2023-07-28:14:01  2008  git push -u origin adithyare/lora_nvgpt
+2023-07-28:14:01  2008  git push -u origin adithyare/lora_nvgpt
+2023-07-31:09:50  1999  git push -u origin adithyare/lora_nvgpt
+2023-08-02:09:08  1999  git push -u origin adithyare/peft_mem
+2023-08-02:23:17  1999  conda activate n22
+2023-08-10:10:08  2002  cd vllm/
+2023-08-10:10:08  2003  ls
+2023-08-10:10:09  2003  ls
+2023-08-10:10:09  2003  ls
+2023-08-10:10:09  2004  vi dockerfile
+2023-08-10:10:14  2005  docker build -t vllm:codeserver -f dockerfile . 
+2023-08-10:10:17  2005  docker build -t vllm:codeserver -f dockerfile . 
+2023-08-10:10:17  2005  docker build -t vllm:codeserver -f dockerfile . 
+2023-08-10:10:18  2005  docker build -t vllm:codeserver -f dockerfile . 
+2023-08-10:10:18  2005  docker build -t vllm:codeserver -f dockerfile . 
+2023-08-10:10:18  2000  ssh_selene 
+2023-08-10:10:18  2000  ssh_selene 
+2023-08-10:10:18  2001  ls
+2023-08-10:10:19  2002  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/tkonuk/workspace/tugrulkonuk/vllm:/vllm vllm:codeserver
+2023-08-10:10:19  2002  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/tkonuk/workspace/tugrulkonuk/vllm:/vllm vllm:codeserver
+2023-08-10:10:19  2002  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/tkonuk/workspace/tugrulkonuk/vllm:/vllm vllm:codeserver
+2023-08-10:10:19  2003  pwd
+2023-08-10:10:19  2004  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/adithyare/vllm:/vllm vllm:codeserver
+2023-08-10:10:20  2005  scp adithyare@selene-login-01:~/*ckpt .
+2023-08-10:10:20  2006  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/adithyare/vllm:/vllm vllm:codeserver
+2023-08-10:10:20  2007  ls ../pretrained_models/megatron_gpt_2b/
+2023-08-10:10:21  2008  scp -r adithyare@selene-login-01:/lustre/fsw/sa/tkonuk/steerlm_2b .
+2023-08-10:10:22  2009  scp -r adithyare@selene-login-01:/lustre/fsw/sa/tkonuk/nvgpt-2b-steerlm .
+2023-08-10:10:22  2010  ls
+2023-08-10:10:22  2011  \rm -rf steerlm_2b
+2023-08-10:10:22  2012  ls
+2023-08-10:10:23  2013  mkdir 2b_lora_weights
+2023-08-10:10:23  2014  mv 2b_lora_weights.ckpt 2b_lora_weights/model_weights.ckpt
+2023-08-10:10:23  2015  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/adithyare/vllm:/vllm vllm:codeserver
+2023-08-10:10:23  2016  git status
+2023-08-10:10:23  2017  mv nvgpt-2b-steerlm ../
+2023-08-10:10:24  2018  mv 2b_lora_weights ../
+2023-08-10:10:24  2019  #docker run -it --gpus all --shm-size=16g -p 8888:8888 -p 6006:6006  -e "PASSWORD=redpajama" --ulimit memlock=-1 --ulimit stack=67108864 -v /media/tkonuk/wdfs1/hub/:/hub -v /home/adithyare/vllm:/vllm vllm:codeserver
+2023-08-10:10:24  2024  cd vllm/
+2023-08-10:10:29  2000  ssh_selene 
+2023-08-10:10:29  2000  ssh_selene 
+2023-08-10:10:46  2005  cd ~/vllm/
+2023-08-10:10:46  2005  cd ~/vllm/
+2023-08-10:10:46  2006  ls
+2023-08-10:10:46  2007  docker ps
+2023-08-10:11:48  2000  ssh_selene 
+2023-08-10:11:48  2001  ls
+2023-08-10:12:02  2000  ls
+2023-08-10:12:22  2001  ls /hub/

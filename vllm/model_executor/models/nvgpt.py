@@ -87,9 +87,7 @@ class NVGPTMLP(torch.nn.Module):
         self.activation_func = SiluAndMul()
 
     def forward(self, x):
-        #print(f'input: {x.shape}\t\tweight: {self.dense_h_to_4h.weight.shape}')
         intermediate_parallel, _ = self.dense_h_to_4h(x)
-        #print(f'intermediate:{intermediate_parallel.shape}\t\tx: {x.shape}')
         x = self.activation_func(intermediate_parallel)
         x, _ = self.dense_4h_to_h(x)
         return x
@@ -149,11 +147,8 @@ class NVGPTAttention(torch.nn.Module):
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
-        print('hidden_states', hidden_states.shape,  hidden_states.sum(-1))
         qkv, _ = self.query_key_value(hidden_states)        
-        print('qkv values', qkv.shape, qkv.sum(-1))
         lora_qkv, _ = self.lora_layer(hidden_states)
-        print('lora qkv values', lora_qkv.shape, lora_qkv.sum(-1), lora_qkv[0][:10])
         qkv = qkv + lora_qkv
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
@@ -161,10 +156,7 @@ class NVGPTAttention(torch.nn.Module):
 
         k_cache, v_cache = kv_cache
         attn_output = self.attn(positions, q, k, v, k_cache, v_cache, input_metadata, cache_event)        
-        print('core_attn', attn_output.shape, attn_output.sum(-1))
         output, _ = self.dense(attn_output)
-        print('dense out', output.shape, output.sum(-1))
-        print("end of attn layer....\n\n")
         return output
 
 class NVGPTDecoderLayer(torch.nn.Module):
@@ -228,9 +220,6 @@ class NVGPTModel(torch.nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:      
-        print(input_ids.shape, input_ids)
-        #import pdb
-        #pdb.set_trace()
         hidden_states = self.embedding(input_ids)
         for i in range(len(self.layers)):
             if cache_events is None:
@@ -288,38 +277,12 @@ class NVGPTForCausalLM(torch.nn.Module):
         for nemo_name, loaded_weight in torch.load(lora_path, map_location="cpu").items():
             name = self.map_name(nemo_name)
             param = state_dict[name]
-            print(name, loaded_weight.shape, param.shape)
-            #import pdb
-            #pdb.set_trace()
-            if "Xlora_layer.linear_in" in name:
+            if "lora_layer.linear_out" in name:
                 # NVGPT's fused QKV has the shape of
                 # [num_heads * 3 * head_size, hidden_size], while the
                 # required shape is [3 * num_heads * head_size, hidden_size].
                 # Thus, we need weight conversion.
                 # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
-                print(loaded_weight.shape, "input to reshape")
-                #loaded_weight = loaded_weight.transpose(0, 1)
-                shard_size = param.shape[0]
-                start = shard_size * tensor_model_parallel_rank
-                end = shard_size * (tensor_model_parallel_rank + 1)
-                loaded_weight = loaded_weight[start:end]
-
-                #num_heads = self.config.num_attention_heads
-                #head_size = self.config.hidden_size // num_heads
-                hidden_size = self.config.hidden_size
-                rank_size = 16
-
-                #loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
-                #opt 1loaded_weight = loaded_weight.view(rank_size, 1, num_head, hidden_size)
-                loaded_weight = loaded_weight.view(rank_size, hidden_size)
-
-            elif "lora_layer.linear_out" in name:
-                # NVGPT's fused QKV has the shape of
-                # [num_heads * 3 * head_size, hidden_size], while the
-                # required shape is [3 * num_heads * head_size, hidden_size].
-                # Thus, we need weight conversion.
-                # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
-                print(loaded_weight.shape, "lora linear out size")
                 shard_size = param.shape[0]
                 start = shard_size * tensor_model_parallel_rank
                 end = shard_size * (tensor_model_parallel_rank + 1)

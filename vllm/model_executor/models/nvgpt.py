@@ -325,14 +325,14 @@ class NVGPTForCausalLM(torch.nn.Module):
                 end = shard_size * (tensor_model_parallel_rank + 1)
                 loaded_weight = loaded_weight[start:end]
 
-                num_heads = self.config.num_attention_heads
-                head_size = self.config.hidden_size // num_heads
-                rank_size = 16 
+                num_heads_per_rank = self.config.num_attention_heads // get_tensor_model_parallel_world_size()
+                head_size = self.config.hidden_size // self.config.num_attention_heads
+                rank_size = 16
 
                 #loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
-                loaded_weight = loaded_weight.view(num_heads, 3, head_size, rank_size)
+                loaded_weight = loaded_weight.view(num_heads_per_rank, 3, head_size, rank_size)
                 loaded_weight = loaded_weight.transpose(0, 1)
-                loaded_weight = loaded_weight.reshape(3 * head_size * num_heads, rank_size)                  
+                loaded_weight = loaded_weight.reshape(3 * head_size * num_heads_per_rank, rank_size)                  
 
             #loaded_weight = loaded_weight.to(torch.bfloat16)
             load_tensor_parallel_weights(param, loaded_weight, name,

@@ -185,9 +185,11 @@ class LLMEngine:
             arrival_time = time.time()
         if prompt_token_ids is None:
             assert prompt is not None
-            prompt_token_ids = self.tokenizer.encode(prompt)
+            prompt_token_ids = self.tokenizer.encode(prompt)[1:]
 
         # Create the sequences.
+        import pdb
+        pdb.set_trace()
         block_size = self.cache_config.block_size
         seqs: List[Sequence] = []
         for _ in range(sampling_params.best_of):

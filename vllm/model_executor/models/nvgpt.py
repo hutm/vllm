@@ -139,7 +139,7 @@ class NVGPTAttention(torch.nn.Module):
                                            rotary_dim=rotary_dim)
         
         self.lora_layer = LoraLayer(in_features=self.hidden_size, 
-                                    out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=32)
+                                    out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=16)
                 
     def forward(
         self,
@@ -149,16 +149,24 @@ class NVGPTAttention(torch.nn.Module):
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
+        print('hidden_states', hidden_states.shape,  hidden_states.sum(-1))
         qkv, _ = self.query_key_value(hidden_states)        
+        print('qkv values', qkv.shape, qkv.sum(-1))
         lora_qkv, _ = self.lora_layer(hidden_states)
-        qkv = qkv + lora_qkv
+        print('lora qkv values', lora_qkv.shape, lora_qkv.sum(-1), lora_qkv[0][:10])
+        import pdb
+        pdb.set_trace()
+        #qkv = qkv + lora_qkv
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         q, k, v = torch.chunk(qkv, 3, dim=-1)          
 
         k_cache, v_cache = kv_cache
         attn_output = self.attn(positions, q, k, v, k_cache, v_cache, input_metadata, cache_event)        
+        print('core_attn', attn_output.shape, attn_output.sum(-1))
         output, _ = self.dense(attn_output)
+        print('dense out', output.shape, output.sum(-1))
+        print("end of attn layer....\n\n")
         return output
 
 class NVGPTDecoderLayer(torch.nn.Module):
@@ -222,6 +230,9 @@ class NVGPTModel(torch.nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:      
+        print(input_ids.shape, input_ids)
+        import pdb
+        pdb.set_trace()
         hidden_states = self.embedding(input_ids)
         for i in range(len(self.layers)):
             if cache_events is None:
@@ -265,7 +276,7 @@ class NVGPTForCausalLM(torch.nn.Module):
                                    input_metadata)
         return next_tokens
 
-    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight", "lora_layer.linear_out.weight"]
+    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight"]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
 
 
@@ -280,26 +291,49 @@ class NVGPTForCausalLM(torch.nn.Module):
             name = self.map_name(nemo_name)
             param = state_dict[name]
             print(name, loaded_weight.shape, param.shape)
+            #import pdb
+            #pdb.set_trace()
+            if "lora_layer.linear_in" in name:
+                # NVGPT's fused QKV has the shape of
+                # [num_heads * 3 * head_size, hidden_size], while the
+                # required shape is [3 * num_heads * head_size, hidden_size].
+                # Thus, we need weight conversion.
+                # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
+                loaded_weight = loaded_weight.transpose(0, 1)
+                shard_size = param.shape[0]
+                start = shard_size * tensor_model_parallel_rank
+                end = shard_size * (tensor_model_parallel_rank + 1)
+                loaded_weight = loaded_weight[start:end]
 
-            #if "lora_layer.linear_out" in name:
-            #    # NVGPT's fused QKV has the shape of
-            #    # [num_heads * 3 * head_size, hidden_size], while the
-            #    # required shape is [3 * num_heads * head_size, hidden_size].
-            #    # Thus, we need weight conversion.
-            #    # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
-            #    shard_size = param.shape[0]
-            #    start = shard_size * tensor_model_parallel_rank
-            #    end = shard_size * (tensor_model_parallel_rank + 1)
-            #    loaded_weight = loaded_weight[start:end]
+                num_heads = self.config.num_attention_heads
+                hidden_size = self.config.hidden_size
+                head_size = hidden_size // num_heads
 
-            #    num_heads = self.config.num_attention_heads
-            #    hidden_size = self.config.hidden_size
-            #    head_size = hidden_size // num_heads
+                loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
+                loaded_weight = loaded_weight.transpose(0, 1)
+                loaded_weight = loaded_weight.reshape(-1, hidden_size) 
+                #loaded_weight = loaded_weight.transpose(0, 1)
 
-            #    loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
-            #    loaded_weight = loaded_weight.transpose(0, 1)
-            #    loaded_weight = loaded_weight.reshape(-1, hidden_size)                  
+            elif "lora_layer.linear_out" in name:
+                # NVGPT's fused QKV has the shape of
+                # [num_heads * 3 * head_size, hidden_size], while the
+                # required shape is [3 * num_heads * head_size, hidden_size].
+                # Thus, we need weight conversion.
+                # In the case of lora_layer.linear_out we have [num_heads * 3 * head_size, adapter_dim] shaped matrix
+                shard_size = param.shape[0]
+                start = shard_size * tensor_model_parallel_rank
+                end = shard_size * (tensor_model_parallel_rank + 1)
+                loaded_weight = loaded_weight[start:end]
 
+                num_heads = self.config.num_attention_heads
+                head_size = hidden_size // num_heads
+                hidden_size = 16 
+
+                loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
+                loaded_weight = loaded_weight.transpose(0, 1)
+                loaded_weight = loaded_weight.reshape(-1, hidden_size)                  
+
+            #loaded_weight = loaded_weight.to(torch.bfloat16)
             load_tensor_parallel_weights(param, loaded_weight, name,
                                          self._column_parallel_weights,
                                          self._row_parallel_weights,

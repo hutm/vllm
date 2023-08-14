@@ -100,7 +100,9 @@ def load_tensor_parallel_weights(
     assert param.shape == loaded_weight.shape, (
         f"{param_name} shape mismatch between model and checkpoint: "
         f"{param.shape} != {loaded_weight.shape}")
+    #param.data.copy_(loaded_weight.type_as(param))
     param.data.copy_(loaded_weight)
+    #.type_as(param))
 
 
 def initialize_dummy_weights(

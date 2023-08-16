@@ -54,5 +54,4 @@ def get_model(model_config: ModelConfig) -> nn.Module:
         if model_config.ptuning_model_path:
             model.load_ptuning_weights(model_config.ptuning_model_path)
         model = model.cuda()
-        print(model)
     return model.eval()

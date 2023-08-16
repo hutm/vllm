@@ -13,7 +13,7 @@ def generate():
 
     sampling_params = SamplingParams(temperature=0.0, top_k=-1)
 
-    llm = LLM(model='/hub/nvgpt-2b-001/', ptuning_model_path="/hub/2b_ptuning_overfit_squad/ptuning_state_dict.ckpt", tensor_parallel_size=1)
+    llm = LLM(model='/hub/nvgpt-2b-001/', ptuning_model_path="/hub/2b_ptuning_overfit_squad/ptuning_state_dict.ckpt", tensor_parallel_size=2)
 
     print('#'*100)
     print('#'*100)

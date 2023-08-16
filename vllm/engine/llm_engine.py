@@ -79,6 +79,8 @@ class LLMEngine:
 
         self.tokenizer = get_tokenizer(
             model_config.tokenizer, tokenizer_mode=model_config.tokenizer_mode)
+        additional_special_tokens_dict = {'additional_special_tokens': ['<VTok>']}
+        self.tokenizer.add_special_tokens(additional_special_tokens_dict)
         self.seq_counter = Counter()
 
         # Create the parallel GPU workers.

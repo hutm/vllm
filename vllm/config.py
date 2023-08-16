@@ -34,6 +34,8 @@ class ModelConfig:
     def __init__(
         self,
         model: str,
+        lora_model_path: Optional[str],
+        ptuning_model_path: Optional[str],
         tokenizer: str,
         tokenizer_mode: str,
         download_dir: Optional[str],
@@ -43,6 +45,8 @@ class ModelConfig:
         seed: int,
     ) -> None:
         self.model = model
+        self.lora_model_path = lora_model_path
+        self.ptuning_model_path = ptuning_model_path
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
         self.download_dir = download_dir
@@ -214,7 +218,6 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    return torch.float32
     config_dtype = getattr(config, "torch_dtype", None)
     if config_dtype is None:
         config_dtype = torch.float32

@@ -41,6 +41,8 @@ class LLM:
     def __init__(
         self,
         model: str,
+        lora_model_path: Optional[str] = None,
+        ptuning_model_path: Optional[str] = None,
         tokenizer: Optional[str] = None,
         tokenizer_mode: str = "auto",
         tensor_parallel_size: int = 1,
@@ -54,6 +56,8 @@ class LLM:
             tokenizer_mode = "slow"
         engine_args = EngineArgs(
             model=model,
+            lora_model_path=lora_model_path,
+            ptuning_model_path=ptuning_model_path,
             tokenizer=tokenizer,
             tokenizer_mode=tokenizer_mode,
             tensor_parallel_size=tensor_parallel_size,

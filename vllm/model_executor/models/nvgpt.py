@@ -211,6 +211,8 @@ class NVGPTModel(torch.nn.Module):
             NVGPTDecoderLayer(config) for _ in range(config.num_layers)
         ])
         self.final_layernorm = NVGPTLayerNorm1P(config.hidden_size, eps=config.layernorm_eps)
+        self.ptuning_embeddings = VocabParallelEmbedding(10, config.hidden_size, perform_initialization=False)
+        self.register_buffer("indices", torch.LongTensor(list(range(10))), persistent=False)
 
     def forward(
         self,
@@ -220,7 +222,14 @@ class NVGPTModel(torch.nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:      
+            
+        vtokens = torch.where(input_ids == self.embedding.num_embeddings)[0]
+        input_ids[vtokens] = 0
         hidden_states = self.embedding(input_ids)
+        if len(vtokens) > 0:
+            f = torch.tile(self.ptuning_embeddings(self.indices), (len(vtokens) // self.ptuning_embeddings.num_embeddings,1))
+            hidden_states[vtokens] = f
+            
         for i in range(len(self.layers)):
             if cache_events is None:
                 cache_event = None
@@ -263,12 +272,15 @@ class NVGPTForCausalLM(torch.nn.Module):
                                    input_metadata)
         return next_tokens
 
-    _column_parallel_weights = ["embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight"]
+    _column_parallel_weights = ["ptuning_embeddings.weight", "embedding.weight", "lm_head.weight", "dense_h_to_4h.weight", "lora_layer.linear_in.weight"]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
 
 
     def map_name(self, name):
         return name.replace('model.language_model.encoder.', 'model.').replace("adapter_layer.lora_kqv_adapter.", "lora_layer.")
+
+    def load_ptuning_weights(self, ptuning_path: str):
+        self.load_lora_weights(ptuning_path)
 
     def load_lora_weights(self, lora_path: str):
         tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()

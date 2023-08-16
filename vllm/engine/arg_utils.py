@@ -11,6 +11,8 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
 class EngineArgs:
     """Arguments for vLLM engine."""
     model: str
+    lora_model_path: Optional[str] = None,
+    ptuning_model_path: Optional[str] = None,
     tokenizer: Optional[str] = None
     tokenizer_mode: str = 'auto'
     download_dir: Optional[str] = None
@@ -140,7 +142,7 @@ class EngineArgs:
         self,
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig]:
         # Initialize the configs.
-        model_config = ModelConfig(self.model, self.tokenizer,
+        model_config = ModelConfig(self.model, self.lora_model_path, self.ptuning_model_path, self.tokenizer,
                                    self.tokenizer_mode, self.download_dir,
                                    self.use_np_weights, self.use_dummy_weights,
                                    self.dtype, self.seed)

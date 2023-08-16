@@ -49,6 +49,10 @@ def get_model(model_config: ModelConfig) -> nn.Module:
         # Load the weights from the cached or downloaded files.
         model.load_weights(model_config.model, model_config.download_dir,
                            model_config.use_np_weights)
-        model.load_lora_weights("/hub/2b_lora_overfit_squad/model_weights.ckpt")
+        if model_config.lora_model_path:
+            model.load_lora_weights(model_config.lora_model_path)
+        if model_config.ptuning_model_path:
+            model.load_ptuning_weights(model_config.ptuning_model_path)
         model = model.cuda()
+        print(model)
     return model.eval()

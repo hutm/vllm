@@ -144,6 +144,12 @@ class Worker:
         # Add prompt tokens.
         prompt_lens: List[int] = []
         for seq_group_metadata in seq_group_metadata_list:
+            if seq_group_metadata.task is not None:
+                print(f'task: {seq_group_metadata.task.get_config().in_features}')
+                print(f'task: {seq_group_metadata.task.get_config().out_features}')
+                print(f'task: {seq_group_metadata.task.get_config().dim}')
+                print(f'is_prompt: {seq_group_metadata.is_prompt}')
+                #lora_model = get_lora_model(seq_group_metadata.task.get_state_dict())
             if not seq_group_metadata.is_prompt:
                 continue
 
@@ -241,6 +247,7 @@ class Worker:
             max_context_len=max_context_len,
             block_tables=block_tables_tensor,
         )
+
         return tokens_tensor, positions_tensor, input_metadata
 
     @torch.inference_mode()

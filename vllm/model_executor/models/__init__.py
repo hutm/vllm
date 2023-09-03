@@ -6,6 +6,7 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.mpt import MPTForCausalLM
 from vllm.model_executor.models.opt import OPTForCausalLM
 from vllm.model_executor.models.nvgpt import NVGPTForCausalLM
+from vllm.model_executor.adapters.lora import LoRAModel
 
 __all__ = [
     "BloomForCausalLM",
@@ -16,4 +17,5 @@ __all__ = [
     "MPTForCausalLM",
     "OPTForCausalLM",
     "NVGPTForCausalLM",
+    "LoRAModel",
 ]

@@ -2,7 +2,7 @@ import time
 from typing import Any, List, Optional
 
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig)
+                         SchedulerConfig, LoRAConfig)
 from vllm.core.scheduler import Scheduler
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.ray_utils import DeviceID, initialize_cluster, ray
@@ -15,9 +15,11 @@ from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
 from vllm.utils import Counter
 from vllm.worker.worker import Worker
 
+from vllm.engine.adapter_engine import Task, LoRAEngine
 logger = init_logger(__name__)
 
-
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
 
@@ -109,6 +111,13 @@ class LLMEngine:
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config, log_stats)
 
+        # Create the LoRA engine
+        self.lora_engine = LoRAEngine(model_config=model_config)
+        print(f'lora_engine: {self.lora_engine.tasks}')
+        print(f'lora_engine_task_2: {self.lora_engine.get_task("TASK2")}')
+        print(f'lora_engine_model: {self.lora_engine.base_model_config.model}')
+        print(f'get_tensor_model_parallel_rank(): {get_tensor_model_parallel_rank()}')
+
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -166,6 +175,7 @@ class LLMEngine:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
+        task_name: Optional[str] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -197,9 +207,12 @@ class LLMEngine:
             seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
             seqs.append(seq)
 
+        # Get the task
+        task = self.lora_engine.get_task(task_name) if task_name is not None else None
+
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, seqs, sampling_params,
-                                  arrival_time)
+                                  arrival_time, task=task)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)

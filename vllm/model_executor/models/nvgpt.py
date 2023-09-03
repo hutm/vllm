@@ -137,7 +137,7 @@ class NVGPTAttention(torch.nn.Module):
                                            rotary_dim=rotary_dim)
         
         self.lora_layer = LoraLayer(in_features=self.hidden_size, 
-                                    out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=16)
+                                    out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=32)
                 
     def forward(
         self,
@@ -302,7 +302,7 @@ class NVGPTForCausalLM(torch.nn.Module):
 
                 num_heads_per_rank = self.config.num_attention_heads // get_tensor_model_parallel_world_size()
                 head_size = self.config.hidden_size // self.config.num_attention_heads
-                rank_size = 16
+                rank_size = 32
 
                 #loaded_weight = loaded_weight.view(-1, 3, head_size, hidden_size)
                 loaded_weight = loaded_weight.view(num_heads_per_rank, 3, head_size, rank_size)

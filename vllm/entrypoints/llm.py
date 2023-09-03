@@ -84,6 +84,7 @@ class LLM:
         sampling_params: Optional[SamplingParams] = None,
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
+        tasks: Optional[Union[str, List[str]]] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -117,6 +118,11 @@ class LLM:
             # Use default sampling params.
             sampling_params = SamplingParams()
 
+        # Task-related functionality
+        if isinstance(tasks, str):
+            # Convert a single prompt to a list.
+            tasks = [tasks]
+
         # Add requests to the engine.
         if prompts is not None:
             num_requests = len(prompts)
@@ -124,11 +130,12 @@ class LLM:
             num_requests = len(prompt_token_ids)
         for i in range(num_requests):
             prompt = prompts[i] if prompts is not None else None
+            task = tasks[i] if tasks is not None else None
             if prompt_token_ids is None:
                 token_ids = None
             else:
                 token_ids = prompt_token_ids[i]
-            self._add_request(prompt, sampling_params, token_ids)
+            self._add_request(prompt, sampling_params, token_ids, task)
         return self._run_engine(use_tqdm)
 
     def _add_request(
@@ -136,10 +143,11 @@ class LLM:
         prompt: Optional[str],
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
+        task: Optional[str],
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id, prompt, sampling_params,
-                                    prompt_token_ids)
+                                    prompt_token_ids, task_name=task)
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.

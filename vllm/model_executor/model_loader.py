@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, LoRAConfig
 from vllm.model_executor.models import *  # pylint: disable=wildcard-import
 from vllm.model_executor.weight_utils import initialize_dummy_weights
 
@@ -22,6 +22,10 @@ _MODEL_REGISTRY = {
     "NVGPTForCausalLM": NVGPTForCausalLM,
 }
 
+# Useless for now
+_ADAPTER_REGISTRY = {
+    "LoRAModel": LoRAModel,
+}
 
 def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
     architectures = getattr(config, "architectures", [])
@@ -49,9 +53,22 @@ def get_model(model_config: ModelConfig) -> nn.Module:
         # Load the weights from the cached or downloaded files.
         model.load_weights(model_config.model, model_config.download_dir,
                            model_config.use_np_weights)
-        if model_config.lora_model_path:
-            model.load_lora_weights(model_config.lora_model_path)
+        #if model_config.lora_model_path:
+        #    model.load_lora_weights(model_config.lora_model_path)
         if model_config.ptuning_model_path:
             model.load_ptuning_weights(model_config.ptuning_model_path)
         model = model.cuda()
+    return model.eval()
+
+def get_lora_model(lora_config: LoRAConfig) -> nn.Module:
+    adapter_class = LoRAModel
+    torch.set_default_dtype(lora_config.dtype)
+
+    # Create a model instance.
+    # The weights will be initialized as empty tensors.
+    model = adapter_class(lora_config)
+    if lora_config.model_path:
+        model.load_lora_weights(lora_config.model_path)
+
+    model = model.cuda()
     return model.eval()

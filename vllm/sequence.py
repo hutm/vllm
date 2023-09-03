@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from vllm.block import LogicalTokenBlock
 from vllm.sampling_params import SamplingParams
-
+from vllm.engine.adapter_engine import Task
 
 class SequenceStatus(enum.Enum):
     """Status of a sequence."""
@@ -199,11 +199,13 @@ class SequenceGroup:
         seqs: List[Sequence],
         sampling_params: SamplingParams,
         arrival_time: float,
+        task: Optional[Task] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
+        self.task = task
 
     def get_seqs(
         self,
@@ -252,12 +254,14 @@ class SequenceGroupMetadata:
         seq_data: Dict[int, SequenceData],
         sampling_params: SamplingParams,
         block_tables: Dict[int, List[int]],
+        task: Optional[Task] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
         self.seq_data = seq_data
         self.sampling_params = sampling_params
         self.block_tables = block_tables
+        self.task = task
 
 
 class SequenceOutputs:

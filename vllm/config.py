@@ -11,6 +11,33 @@ logger = init_logger(__name__)
 
 _GB = 1 << 30
 
+class LoRAConfig:
+    """Configuration for LoRA models
+    """
+
+    def __init__(
+            self,
+            model_path: str,
+            base_model: str,
+            in_features: int,
+            out_features: int,
+            dim: int,
+            dtype: str,
+    ):        
+        self.model_path = model_path
+        self.base_model = base_model
+        self.in_features = in_features
+        self.out_features = out_features
+        self.dim = dim
+
+        base_model_config = get_config(base_model)
+        self.num_layers = base_model_config.num_hidden_layers
+        self.hidden_dim = base_model_config.hidden_size
+        self.num_attention_heads = base_model_config.num_attention_heads        
+        self.dtype = _get_and_verify_dtype(base_model_config, dtype)
+
+    def get_dim(self) -> int:
+        return self.dim
 
 class ModelConfig:
     """Configuration for the model.

@@ -209,6 +209,9 @@ class LLMEngine:
 
         # Get the task
         task = self.lora_engine.get_task(task_name) if task_name is not None else None
+        print('t'*100)
+        print(f'TASK: {task.name}')
+        print('t'*100)
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, seqs, sampling_params,

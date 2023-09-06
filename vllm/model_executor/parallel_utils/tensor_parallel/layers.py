@@ -293,7 +293,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
 
 
-    def forward(self, input_):
+    def forward(self, input_, weight = None):
         """Forward of ColumnParallelLinear
 
         Args:
@@ -303,11 +303,14 @@ class ColumnParallelLinear(torch.nn.Module):
             - output
             - bias
         """
+        if weight is None:
+            weight = self.weight
+
         bias = self.bias if not self.skip_bias_add else None
 
         input_parallel = input_
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight, bias)
+        output_parallel = F.linear(input_parallel, weight, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)

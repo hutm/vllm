@@ -143,13 +143,14 @@ class Worker:
 
         # Add prompt tokens.
         prompt_lens: List[int] = []
+
+        # Add task weights
+        peft_weights = []
         for seq_group_metadata in seq_group_metadata_list:
-            #if seq_group_metadata.task is not None:
-            #    print(f'task: {seq_group_metadata.task.get_config().in_features}')
-            #    print(f'task: {seq_group_metadata.task.get_config().out_features}')
-            #    print(f'task: {seq_group_metadata.task.get_config().dim}')
-            #    print(f'is_prompt: {seq_group_metadata.is_prompt}')
-            #    #lora_model = get_lora_model(seq_group_metadata.task.get_state_dict())
+            if seq_group_metadata.task is not None:
+                task = seq_group_metadata.task
+                # Organize task weights
+                peft_weights.append(task.get_state_dict())                
             if not seq_group_metadata.is_prompt:
                 continue
 
@@ -187,10 +188,15 @@ class Worker:
         max_context_len = 0
         max_num_blocks_per_seq = 0
         context_lens: List[int] = []
-        generation_block_tables: List[List[int]] = []
+        generation_block_tables: List[List[int]] = []                
         for seq_group_metadata in seq_group_metadata_list:
             if seq_group_metadata.is_prompt:
                 continue
+
+            if seq_group_metadata.task is not None:
+                task = seq_group_metadata.task
+                # Organize task weights
+                peft_weights.append(task.get_state_dict())                
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
@@ -218,6 +224,9 @@ class Worker:
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append(slot)
 
+        # PEFT weights
+        # peft_weights = # No need for special treatment for now (TP=1)
+        # @TODO (tugrul): extend this to TP>1
         # Optimization: Pad the input length to be a multiple of 8.
         # This is required for utilizing the Tensor Cores in NVIDIA GPUs.
         input_tokens = _pad_to_alignment(input_tokens, multiple_of=8)
@@ -246,6 +255,7 @@ class Worker:
             context_lens=context_lens_tensor,
             max_context_len=max_context_len,
             block_tables=block_tables_tensor,
+            peft_weights=peft_weights,
         )
 
         return tokens_tensor, positions_tensor, input_metadata

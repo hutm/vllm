@@ -21,6 +21,8 @@ class Task:
         self.filename = filename
         self.state_dict = None
         self.config: LoRAConfig = None
+        self.weights = None
+        self.dtype = torch.bfloat16 # default
 
     def get_name(self):
         return self.name
@@ -36,7 +38,28 @@ class Task:
     
     def set_state_dict(self, sd):
         self.state_dict = sd
+
+    def _get_lora_weights(self):
+        linear_ins=[]
+        linear_outs=[]
+        num_layers = len(self.state_dict.keys()) // 2
+        for i in range(num_layers):
+            in_key=f'model.language_model.encoder.layers.{i}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
+            out_key=f'model.language_model.encoder.layers.{i}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
+            linear_ins.append(self.state_dict[in_key])
+            linear_outs.append(self.state_dict[out_key])
+
+        linear_in_weights = torch.stack(linear_ins).to(self.dtype).cuda() # @TODO (tugrul): extend this to TP>1
+        linear_out_weights = torch.stack(linear_outs).to(self.dtype).cuda()
+        self.weights  = [linear_in_weights, linear_out_weights]
+        return self.weights
     
+    def get_lora_weights(self):
+        if self.weights:
+            return self.weights
+        else:
+            return self._get_lora_weights()
+         
     def build_config(self, base_model_config: ModelConfig):
         if self.state_dict is not None:
             model_path = base_model_config.lora_model_path
@@ -58,7 +81,22 @@ class Task:
         
     def get_config(self):
         return self.config
-            
+
+    def get_dtype(self):
+        if self.state_dict is not None:            
+            keys = self.state_dict.keys()
+            linear_in_key = next(filter(lambda s: 'linear_in' in s, keys), None)
+            #dtype = str(self.state_dict[linear_in_key].dtype).strip('torch.')
+            dtype = self.state_dict[linear_in_key].dtype
+            self.dtype = dtype
+        return self.dtype
+
+    def convert_sd_to_dtype(self, dtype=None):
+        if not dtype:
+            dtype = self.dtype
+        for key in self.state_dict.keys():
+            self.state_dict[key] = self.state_dict[key].to(dtype) # @TODO (tugrul): extend this to multi-GPU
+                
     # Other potential utility methods
     def is_compatible(self, other_task):
         # Check if this task's checkpoint is compatible with another task
@@ -102,8 +140,10 @@ class LoRAEngine:
         for task in self.tasks.values():
             filepath = os.path.join(directory, task.filename)
             if os.path.exists(filepath):
-                task.set_state_dict(torch.load(filepath, map_location='cpu'))
-                task.build_config(self.base_model_config)
+                task.set_state_dict(torch.load(filepath, map_location='cuda:0')) # @TODO (tugrul): extend this to multi-GPU
+                dtype = task.dtype
+                task.convert_sd_to_dtype(dtype)
+
             else:
                 print(f"Warning: Checkpoint {task.filename} listed in metadata but not found in directory.")
 

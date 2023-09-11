@@ -29,6 +29,7 @@ class InputMetadata:
         context_lens: torch.Tensor,
         max_context_len: int,
         block_tables: torch.Tensor,
+        peft_weights: List[torch.Tensor] = []
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -51,6 +52,8 @@ class InputMetadata:
 
         # Set during the execution of the first attention op.
         self.attn_bias: List[AttentionBias] = []
+
+        self.peft_weights = peft_weights
 
     def __repr__(self) -> str:
         # Print only useful metadata.

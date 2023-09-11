@@ -28,6 +28,11 @@ def init_method_const(val):
 
     return init_
 
+def get_lora_keys(id):
+    in_key=f'model.language_model.encoder.layers.{id}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
+    out_key=f'model.language_model.encoder.layers.{id}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
+    return in_key, out_key
+
 class LoraLayer(nn.Module):
     def __init__(
         self,
@@ -56,9 +61,9 @@ class LoraLayer(nn.Module):
             raise NotImplementedError("out_init_method should be zero, normal or xavier")
         return init_fn
 
-    def forward(self, x):
-        x, _ = self.linear_in(x)  
-        x, _ = self.linear_out(x)
+    def forward(self, x, linear_in_weight=None, linear_out_weight=None):
+        x, _ = self.linear_in(x , linear_in_weight)  
+        x, _ = self.linear_out(x, linear_out_weight)
         return x, None
 
 _shape_t = Union[int, List[int], Size]
@@ -146,8 +151,25 @@ class NVGPTAttention(torch.nn.Module):
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
-    ) -> torch.Tensor:
-        qkv, _ = self.query_key_value(hidden_states)        
+        layer_id: Optional[int] = None,
+    ) -> torch.Tensor:         
+        qkv, _ = self.query_key_value(hidden_states)           
+        # Iterate over LoRAs for each inference request
+        if input_metadata.peft_weights:            
+            in_key, out_key = get_lora_keys(layer_id)
+            if len(input_metadata.prompt_lens) == 0:
+                lens = [1 for _ in range(input_metadata.num_valid_tokens)]
+            else: 
+                lens = input_metadata.prompt_lens
+            lora_qkv = torch.zeros_like(qkv)
+            start = 0
+            for k, req_len in enumerate(lens): # req_len: length of the current request
+                linear_in_weight  = input_metadata.peft_weights[k][in_key]
+                linear_out_weight = input_metadata.peft_weights[k][out_key]
+                end = start + req_len
+                lora_qkv[start:end], _ = self.lora_layer(hidden_states[start:end], linear_in_weight, linear_out_weight)
+                start += req_len
+
         lora_qkv, _ = self.lora_layer(hidden_states)
         qkv = qkv + lora_qkv
 
@@ -160,8 +182,9 @@ class NVGPTAttention(torch.nn.Module):
         return output
 
 class NVGPTDecoderLayer(torch.nn.Module):
-    def __init__(self, config: NVGPTConfig):
+    def __init__(self, config: NVGPTConfig, id: int):
         super().__init__()
+        self.id = id # layer number
         self.hidden_size = config.hidden_size
         self.self_attention = NVGPTAttention(config=config)
         self.mlp = NVGPTMLP(config=config)
@@ -186,6 +209,7 @@ class NVGPTDecoderLayer(torch.nn.Module):
             kv_cache=kv_cache,
             input_metadata=input_metadata,
             cache_event=cache_event,
+            layer_id=self.id,
         )
         hidden_states = residual + hidden_states
 
@@ -208,7 +232,7 @@ class NVGPTModel(torch.nn.Module):
             config.hidden_size,
             perform_initialization=False)
         self.layers = nn.ModuleList([
-            NVGPTDecoderLayer(config) for _ in range(config.num_layers)
+            NVGPTDecoderLayer(config, id=id) for id in range(config.num_layers)
         ])
         self.final_layernorm = NVGPTLayerNorm1P(config.hidden_size, eps=config.layernorm_eps)
         self.ptuning_embeddings = VocabParallelEmbedding(10, config.hidden_size, perform_initialization=False)

@@ -293,7 +293,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
 
 
-    def forward(self, input_, weight = None):
+    def forward(self, input_, weight=None):
         """Forward of ColumnParallelLinear
 
         Args:

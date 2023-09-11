@@ -170,7 +170,7 @@ class NVGPTAttention(torch.nn.Module):
                 lora_qkv[start:end], _ = self.lora_layer(hidden_states[start:end], linear_in_weight, linear_out_weight)
                 start += req_len
         
-        qkv = qkv + lora_qkv
+            qkv = qkv + lora_qkv
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         q, k, v = torch.chunk(qkv, 3, dim=-1)          

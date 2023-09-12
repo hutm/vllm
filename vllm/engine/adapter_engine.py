@@ -6,6 +6,7 @@ import json
 import os
 import glob
 import enum
+from dataclasses import dataclass
 
 logger = init_logger(__name__)
 
@@ -116,7 +117,6 @@ class LoRAEngine:
     loads the ones that are compatible with the base model.
     """
     def __init__(self, model_config):
-        self.base_model_config = model_config
         self.base_model_name = model_config.model
         self.metadata_path = os.path.join(model_config.lora_model_path, "metadata.json")
         self.load_metadata()
@@ -152,4 +152,14 @@ class LoRAEngine:
         for task in self.tasks.values():
             if task.name == identifier or task.uuid == identifier:
                 return task
-        return None 
+        return None
+
+@dataclass
+class ModelConfigSimple:
+    lora_model_path: str
+    model: str
+
+#TODO: khadkevich move to singleton and remove hardcoded values
+LORA_ENGINE = LoRAEngine(
+    model_config=ModelConfigSimple(lora_model_path='/hub/lora/', model='nvgpt-2b-001')
+)

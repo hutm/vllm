@@ -55,8 +55,8 @@ def get_model(model_config: ModelConfig) -> nn.Module:
                            model_config.use_np_weights)
         #if model_config.lora_model_path:
         #    model.load_lora_weights(model_config.lora_model_path)
-        if model_config.ptuning_model_path:
-            model.load_ptuning_weights(model_config.ptuning_model_path)
+        # if model_config.ptuning_model_path: # TODO khadkevich throws AttributeError: 'OPTForCausalLM' object has no attribute 'load_ptuning_weights'
+        #     model.load_ptuning_weights(model_config.ptuning_model_path)
         model = model.cuda()
     return model.eval()
 

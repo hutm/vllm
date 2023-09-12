@@ -302,7 +302,7 @@ class Scheduler:
                 seq_data=seq_data,
                 sampling_params=seq_group.sampling_params,
                 block_tables=block_tables,
-                task=seq_group.task,
+                customization_id=seq_group.customization_id,
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs, ignored_seq_groups

@@ -1,4 +1,5 @@
 import time
+import uuid
 from typing import Any, List, Optional
 
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
@@ -111,13 +112,6 @@ class LLMEngine:
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config, log_stats)
 
-        # Create the LoRA engine
-        self.lora_engine = LoRAEngine(model_config=model_config)
-        print(f'lora_engine: {self.lora_engine.tasks}')
-        print(f'lora_engine_task_2: {self.lora_engine.get_task("TASK2")}')
-        print(f'lora_engine_model: {self.lora_engine.base_model_config.model}')
-        print(f'get_tensor_model_parallel_rank(): {get_tensor_model_parallel_rank()}')
-
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -175,7 +169,7 @@ class LLMEngine:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
-        task_name: Optional[str] = None,
+        customization_id: Optional[uuid.UUID] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -192,6 +186,7 @@ class LLMEngine:
                 use the tokenizer to convert the prompts to token IDs.
             arrival_time: The arrival time of the request. If None, we use
                 the current time.
+            customization_id: Id of the customization
         """
         if arrival_time is None:
             arrival_time = time.time()
@@ -207,12 +202,9 @@ class LLMEngine:
             seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
             seqs.append(seq)
 
-        # Get the task
-        task = self.lora_engine.get_task(task_name) if task_name is not None else None
-
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, seqs, sampling_params,
-                                  arrival_time, task=task)
+                                  arrival_time, customization_id=customization_id)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)

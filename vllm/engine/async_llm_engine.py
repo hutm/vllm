@@ -1,5 +1,6 @@
 import asyncio
 import time
+from uuid import UUID
 from typing import Dict, List, Optional
 
 from vllm.config import ModelConfig
@@ -86,7 +87,8 @@ class AsyncLLMEngine:
             prompt: Optional[str],
             sampling_params: SamplingParams,
             request_id: str,
-            prompt_token_ids: Optional[List[int]] = None) -> RequestOutput:
+            prompt_token_ids: Optional[List[int]] = None,
+            customization_id: Optional[UUID] = None) -> RequestOutput:
         """Generate outputs for a request.
 
         Generate outputs for a request. This method is a coroutine. It adds the
@@ -100,6 +102,7 @@ class AsyncLLMEngine:
             request_id: The unique id of the request.
             prompt_token_ids: The token IDs of the prompt. If None, we
                 use the tokenizer to convert the prompts to token IDs.
+            customization_id: customization (LORA or P-tuning) ID
 
         Yields:
             The output `RequestOutput` objects from the LLMEngine for the
@@ -132,7 +135,8 @@ class AsyncLLMEngine:
                                     prompt,
                                     sampling_params,
                                     prompt_token_ids=prompt_token_ids,
-                                    arrival_time=arrival_time)
+                                    arrival_time=arrival_time,
+                                    customization_id=customization_id)
 
         # The vLLM engine does not have a background loop that keeps
         # processing incoming requests. Therefore, we need to keep kicking

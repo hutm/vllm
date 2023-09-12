@@ -3,6 +3,8 @@ import torch
 from torch import nn
 from transformers import NVGPTConfig
 from torch import Tensor, Size
+
+from engine.adapter_engine import LORA_ENGINE
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttentionWithRoPE, PagedAttention
@@ -154,8 +156,8 @@ class NVGPTAttention(torch.nn.Module):
         layer_id: Optional[int] = None,
     ) -> torch.Tensor:         
         qkv, _ = self.query_key_value(hidden_states)           
-        # Iterate over LoRAs for each inference request
-        if input_metadata.peft_weights:            
+        # Iterate over customizations (LoRAs/p-tuning) for each inference request
+        if input_metadata.customization_ids:
             in_key, out_key = get_lora_keys(layer_id)
             if len(input_metadata.prompt_lens) == 0:
                 lens = [1 for _ in range(input_metadata.num_valid_tokens)]
@@ -163,13 +165,17 @@ class NVGPTAttention(torch.nn.Module):
                 lens = input_metadata.prompt_lens
             lora_qkv = torch.zeros_like(qkv)
             start = 0
-            for k, req_len in enumerate(lens): # req_len: length of the current request
-                linear_in_weight  = input_metadata.peft_weights[k][in_key]
-                linear_out_weight = input_metadata.peft_weights[k][out_key]
-                end = start + req_len
-                lora_qkv[start:end], _ = self.lora_layer(hidden_states[start:end], linear_in_weight, linear_out_weight)
-                start += req_len
-        
+            for k, req_len in enumerate(lens):  # req_len: length of the current request
+                # get peft weights for a customization_id
+                task = LORA_ENGINE.get_task(input_metadata.customization_ids[k]) if input_metadata.customization_ids[k] else None
+                if task:
+                    lora_weights = task.get_state_dict()
+                    linear_in_weight  = lora_weights[in_key]
+                    linear_out_weight = lora_weights[out_key]
+                    end = start + req_len
+                    lora_qkv[start:end], _ = self.lora_layer(hidden_states[start:end], linear_in_weight, linear_out_weight)
+                    start += req_len
+
             qkv = qkv + lora_qkv
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]

@@ -145,12 +145,18 @@ class Worker:
         prompt_lens: List[int] = []
 
         # Add task weights
-        peft_weights = []
+        # peft_weights = []
+        # for seq_group_metadata in seq_group_metadata_list:
+        #     if seq_group_metadata.customization_id is not None:
+        #         # Get the task
+        #         task = self.lora_engine.get_task(customization_id) if customization_id is not None else None
+        #         task = seq_group_metadata.task
+        #         # Organize task weights
+        #         peft_weights.append(task.get_state_dict())
+        customization_ids = []
         for seq_group_metadata in seq_group_metadata_list:
-            if seq_group_metadata.task is not None:
-                task = seq_group_metadata.task
-                # Organize task weights
-                peft_weights.append(task.get_state_dict())                
+            customization_ids.append(seq_group_metadata.customization_id)
+
             if not seq_group_metadata.is_prompt:
                 continue
 
@@ -193,10 +199,8 @@ class Worker:
             if seq_group_metadata.is_prompt:
                 continue
 
-            if seq_group_metadata.task is not None:
-                task = seq_group_metadata.task
-                # Organize task weights
-                peft_weights.append(task.get_state_dict())                
+            if seq_group_metadata.customization_id is not None:
+                customization_ids.append(seq_group_metadata.customization_id)
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
@@ -255,7 +259,7 @@ class Worker:
             context_lens=context_lens_tensor,
             max_context_len=max_context_len,
             block_tables=block_tables_tensor,
-            peft_weights=peft_weights,
+            customization_ids=customization_ids,
         )
 
         return tokens_tensor, positions_tensor, input_metadata

@@ -6,6 +6,7 @@ import json
 import os
 import glob
 import enum
+from kink import di
 from dataclasses import dataclass
 
 logger = init_logger(__name__)
@@ -158,8 +159,3 @@ class LoRAEngine:
 class ModelConfigSimple:
     lora_model_path: str
     model: str
-
-#TODO: khadkevich move to singleton and remove hardcoded values
-LORA_ENGINE = LoRAEngine(
-    model_config=ModelConfigSimple(lora_model_path='/hub/lora/', model='nvgpt-2b-001')
-)

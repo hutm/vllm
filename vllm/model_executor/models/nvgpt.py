@@ -1,10 +1,10 @@
+import logging
 from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers import NVGPTConfig
 from torch import Tensor, Size
 
-from engine.adapter_engine import LORA_ENGINE
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttentionWithRoPE, PagedAttention
@@ -18,6 +18,7 @@ from vllm.model_executor.parallel_utils.tensor_parallel import (
 from vllm.sequence import SequenceOutputs
 
 from torch.nn import init
+from kink import di
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -145,6 +146,7 @@ class NVGPTAttention(torch.nn.Module):
         
         self.lora_layer = LoraLayer(in_features=self.hidden_size, 
                                     out_features=3 * self.num_attention_heads * self.hidden_size_per_attention_head, dim=32)
+        self.lora_cache = di["lora_cache"]  # dependency injection to access lora cache object
                 
     def forward(
         self,
@@ -167,8 +169,12 @@ class NVGPTAttention(torch.nn.Module):
             start = 0
             for k, req_len in enumerate(lens):  # req_len: length of the current request
                 # get peft weights for a customization_id
-                task = LORA_ENGINE.get_task(input_metadata.customization_ids[k]) if input_metadata.customization_ids[k] else None
-                if task:
+                customization_id = input_metadata.customization_ids[k]
+                if customization_id:
+                    task = self.lora_cache.get_task(customization_id)
+                    if not task:
+                        logging.debug(f"customization {customization_id} not found. This code should never be reached")
+                        break
                     lora_weights = task.get_state_dict()
                     linear_in_weight  = lora_weights[in_key]
                     linear_out_weight = lora_weights[out_key]

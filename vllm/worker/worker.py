@@ -1,5 +1,6 @@
 """A GPU worker class."""
 import os
+import uuid
 from typing import Dict, List, Tuple, Optional
 
 import torch
@@ -8,6 +9,7 @@ import torch.distributed
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.model_executor import get_model, InputMetadata, set_random_seed
+from vllm.model_executor.adapters.customization_cache import Customization, CustomizationType, CustomizationCache
 from vllm.model_executor.parallel_utils.parallel_state import (
     initialize_model_parallel)
 from vllm.sampling_params import SamplingParams
@@ -46,6 +48,9 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+
+        # customizations cache
+        self.customizations_cache = CustomizationCache()
 
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
@@ -162,9 +167,12 @@ class Worker:
         input_positions: List[int] = []
         slot_mapping: List[int] = []
 
+        customization_ids = []
         # Add prompt tokens.
         prompt_lens: List[int] = []
         for seq_group_metadata in seq_group_metadata_list:
+            customization_ids.append(seq_group_metadata.customization_id)
+
             if not seq_group_metadata.is_prompt:
                 continue
 
@@ -207,6 +215,9 @@ class Worker:
         for seq_group_metadata in seq_group_metadata_list:
             if seq_group_metadata.is_prompt:
                 continue
+
+            if seq_group_metadata.customization_id is not None:
+                customization_ids.append(seq_group_metadata.customization_id)
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
@@ -280,6 +291,8 @@ class Worker:
             max_context_len=max_context_len,
             block_tables=block_tables_tensor,
             sliding_window=self.sliding_window,
+            customization_ids=customization_ids,
+            customization_cache=self.customizations_cache,
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -329,6 +342,11 @@ class Worker:
         )
         return output
 
+    def add_customization_to_cache(self, customization_id: uuid.UUID, customization_type: CustomizationType,
+                                   checkpoint: bytes, dtype=torch.bfloat16) -> bool:
+        self.customizations_cache.put(Customization(customization_id, customization_type, checkpoint, dtype, self.rank,
+                                                    self.parallel_config.world_size, self.model.config))
+        return True
 
 def _init_distributed_environment(
     parallel_config: ParallelConfig,

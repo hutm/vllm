@@ -3,6 +3,7 @@ import time
 from functools import partial
 from typing import (Any, Dict, Iterable, List, Optional, Set, Tuple, Type,
                     Union)
+from uuid import UUID
 
 from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -358,6 +359,7 @@ class AsyncLLMEngine:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
+        customization_id: UUID = None,
     ) -> AsyncStream:
         if self.log_requests:
             shortened_prompt = prompt
@@ -388,7 +390,9 @@ class AsyncLLMEngine:
             prompt=prompt,
             sampling_params=sampling_params,
             prompt_token_ids=prompt_token_ids,
-            arrival_time=arrival_time)
+            arrival_time=arrival_time,
+            customization_id=customization_id,
+        )
 
         return stream
 
@@ -397,7 +401,8 @@ class AsyncLLMEngine:
             prompt: Optional[str],
             sampling_params: SamplingParams,
             request_id: str,
-            prompt_token_ids: Optional[List[int]] = None) -> RequestOutput:
+            prompt_token_ids: Optional[List[int]] = None,
+            customization_id: Optional[UUID] = None) -> RequestOutput:
         """Generate outputs for a request.
 
         Generate outputs for a request. This method is a coroutine. It adds the
@@ -411,6 +416,7 @@ class AsyncLLMEngine:
             request_id: The unique id of the request.
             prompt_token_ids: The token IDs of the prompt. If None, we
                 use the tokenizer to convert the prompts to token IDs.
+            customization_id: customization (LORA or P-tuning) ID
 
         Yields:
             The output `RequestOutput` objects from the LLMEngine for the
@@ -425,7 +431,8 @@ class AsyncLLMEngine:
                                             prompt,
                                             sampling_params,
                                             prompt_token_ids=prompt_token_ids,
-                                            arrival_time=arrival_time)
+                                            arrival_time=arrival_time,
+                                            customization_id=customization_id)
 
             async for request_output in stream:
                 yield request_output

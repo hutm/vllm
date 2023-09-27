@@ -1,3 +1,4 @@
+from vllm.model_executor.models.nvgpt import NVGPTForCausalLM
 from vllm.model_executor.models.aquila import AquilaForCausalLM
 from vllm.model_executor.models.baichuan import (BaiChuanForCausalLM,
                                                  BaichuanForCausalLM)
@@ -30,4 +31,5 @@ __all__ = [
     "OPTForCausalLM",
     "QWenLMHeadModel",
     "MistralForCausalLM",
+    "NVGPTForCausalLM",
 ]

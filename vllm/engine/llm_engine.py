@@ -1,5 +1,6 @@
 import copy
 import time
+import uuid
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
@@ -241,6 +242,7 @@ class LLMEngine:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
+        customization_id: Optional[uuid.UUID] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -257,6 +259,7 @@ class LLMEngine:
                 use the tokenizer to convert the prompts to token IDs.
             arrival_time: The arrival time of the request. If None, we use
                 the current monotonic time.
+            customization_id: Id of the customization
         """
         if arrival_time is None:
             arrival_time = time.monotonic()
@@ -271,7 +274,7 @@ class LLMEngine:
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
-                                  arrival_time)
+                                  arrival_time, customization_id=customization_id)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
@@ -705,3 +708,19 @@ class LLMEngine:
         for other_output in all_outputs[1:]:
             assert output == other_output
         return output
+
+    def add_customization_to_cache(
+            self,
+            customization_id: uuid.UUID,
+            customization_type,
+            checkpoint: bytes,
+    ):
+        self._run_workers(
+            "add_customization_to_cache",
+            customization_id=customization_id,
+            customization_type=customization_type,
+            checkpoint=checkpoint
+        )
+
+
+

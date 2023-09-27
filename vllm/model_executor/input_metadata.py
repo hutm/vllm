@@ -1,8 +1,10 @@
-from typing import Dict, List, Optional, Tuple
+import uuid
+from typing import Dict, List, Tuple, Optional
 
 import torch
 from xformers.ops import AttentionBias
 
+from vllm.model_executor.adapters.customization_cache import CustomizationCache
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import SequenceData
 
@@ -30,6 +32,8 @@ class InputMetadata:
         max_context_len: int,
         block_tables: torch.Tensor,
         sliding_window: Optional[int] = None,
+        customization_ids: List[Optional[uuid.UUID]] = None,
+        customization_cache: CustomizationCache = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -70,6 +74,9 @@ class InputMetadata:
 
         # Set during the execution of the first attention op.
         self.attn_bias: List[AttentionBias] = []
+
+        self.customization_ids = customization_ids
+        self.customization_cache = customization_cache
 
     def __repr__(self) -> str:
         # Print only useful metadata.

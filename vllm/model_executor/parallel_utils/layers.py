@@ -155,11 +155,12 @@ class ColumnParallelLinear(torch.nn.Module):
     def apply_weights(
         self,
         x: torch.Tensor,
+        weights: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        return F.linear(x, self.weight, bias)
+        return F.linear(x, weights, bias)
 
-    def forward(self, input_):
+    def forward(self, input_, weights=None):
         """Forward of ColumnParallelLinear
 
         Args:
@@ -169,11 +170,13 @@ class ColumnParallelLinear(torch.nn.Module):
             - output
             - bias
         """
+        weights = weights if weights is not None else self.weight
+
         bias = self.bias if not self.skip_bias_add else None
 
         input_parallel = input_
         # Matrix multiply.
-        output_parallel = self.apply_weights(input_parallel, bias)
+        output_parallel = self.apply_weights(input_parallel, weights, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)

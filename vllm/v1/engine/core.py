@@ -26,6 +26,7 @@ from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -291,9 +292,30 @@ class EngineCore:
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
-        kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
+        persistent_override = KVConnectorFactory.get_kv_cache_num_blocks_override(
+            vllm_config
         )
+        cache_config = vllm_config.cache_config
+        configured_override = cache_config.num_gpu_blocks_override
+        if (
+            persistent_override is not None
+            and configured_override is not None
+            and persistent_override != configured_override
+        ):
+            raise ValueError(
+                "Persistent KV pool geometry conflicts with "
+                f"num_gpu_blocks_override: {persistent_override} != "
+                f"{configured_override}"
+            )
+        cache_config.num_gpu_blocks_override = (
+            persistent_override or configured_override
+        )
+        try:
+            kv_cache_configs = get_kv_cache_configs(
+                vllm_config, kv_cache_specs, available_gpu_memory
+            )
+        finally:
+            cache_config.num_gpu_blocks_override = configured_override
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
@@ -728,6 +750,12 @@ class EngineCore:
         self.reset_mm_cache()
         self.reset_encoder_cache()
 
+    def _flush_kv_cache_persistence(self) -> None:
+        manager = getattr(self.scheduler, "kv_cache_manager", None)
+        block_pool = getattr(manager, "block_pool", None)
+        if block_pool is not None:
+            block_pool.flush_persistence()
+
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> Future | None:
@@ -756,6 +784,7 @@ class EngineCore:
         self.scheduler.set_pause_state(pause_state)
         if clear_cache:
             self._reset_caches()
+        self._flush_kv_cache_persistence()
 
         return None
 
@@ -1693,6 +1722,7 @@ class EngineCoreProc(EngineCore):
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             if clear_cache:
                 engine._reset_caches()
+            engine._flush_kv_cache_persistence()
             future.set_result(None)
 
         if mode == "abort":
@@ -1707,6 +1737,7 @@ class EngineCoreProc(EngineCore):
         if self._pause_complete():
             if clear_cache:
                 self._reset_caches()
+            self._flush_kv_cache_persistence()
             return None
 
         future = Future[Any]()

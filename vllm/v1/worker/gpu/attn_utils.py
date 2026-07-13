@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
@@ -178,12 +179,19 @@ def _allocate_kv_cache(
         if kv_cache_tensor.block_stride > 0:
             # Allocate once; all packed tensors alias the same backing.
             if packed_backing is None:
-                packed_backing = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
+                packed_tensors = [
+                    tensor
+                    for tensor in kv_cache_config.kv_cache_tensors
+                    if tensor.block_stride > 0
+                ]
+                packed_backing = KVConnectorModelRunnerMixin.allocate_kv_cache_backing(
+                    packed_tensors, kv_cache_tensor.size, device
                 )
             tensor = packed_backing
         else:
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            tensor = KVConnectorModelRunnerMixin.allocate_kv_cache_backing(
+                [kv_cache_tensor], kv_cache_tensor.size, device
+            )
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 

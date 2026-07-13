@@ -42,7 +42,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -64,7 +64,8 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.core.kv_cache_persistence import KVCacheBlockProvider
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
     from vllm.v1.request import Request
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
@@ -247,6 +248,22 @@ class KVConnectorBase_V1(ABC):
             bool: True if connector metadata exists, False otherwise.
         """
         return self._connector_metadata is not None
+
+    def get_kv_cache_tensor_allocator(
+        self,
+    ) -> Callable[[Sequence["KVCacheTensor"], int, torch.device], torch.Tensor] | None:
+        """Return an optional allocator for raw KV-cache backing tensors.
+
+        The callback receives every logical tensor sharing the backing
+        allocation, its exact size in bytes, and the target device. It must
+        return a contiguous ``torch.int8`` tensor of that size. Returning no
+        callback preserves vLLM's native allocation path.
+
+        One logical backing can trigger multiple caching-allocator callbacks,
+        so external memory must be selected at this semantic boundary rather
+        than inferred from allocator callback order.
+        """
+        return None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
@@ -440,6 +457,15 @@ class KVConnectorBase_V1(ABC):
     # Scheduler-side methods
     # ==============================
 
+    def get_kv_cache_block_provider(self) -> "KVCacheBlockProvider | None":
+        """Return an optional provider for externally owned GPU blocks.
+
+        The scheduler binds the provider to its native ``BlockPool``. The
+        provider coordinates physical block ownership and recovered metadata;
+        vLLM remains the sole owner of scheduling and prefix-cache indexes.
+        """
+        return None
+
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """
         Bind the GPU block pool to the connector for per-GPU block status tracking.
@@ -585,6 +611,18 @@ class KVConnectorBase_V1(ABC):
         # TODO: replace with a more general connector hook for keeping the
         # scheduler alive (e.g. extend has_unfinished_requests).
         return False
+
+    @classmethod
+    def get_kv_cache_num_blocks_override(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> int | None:
+        """Return the block count of an existing persistent KV pool.
+
+        vLLM applies this through its native ``num_gpu_blocks_override`` while
+        building configs, keeping capacity checks and tensor sizes coherent.
+        """
+        return None
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_persistence import KVCacheBlockProvider
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -234,6 +235,45 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             )
         return ret
+
+    @classmethod
+    def get_kv_cache_num_blocks_override(cls, vllm_config) -> int | None:
+        overrides = []
+        for connector_cls, temp_config in cls._get_connector_classes_and_configs(
+            vllm_config
+        ):
+            override = connector_cls.get_kv_cache_num_blocks_override(temp_config)
+            if override is not None:
+                overrides.append(override)
+        if len(set(overrides)) > 1:
+            raise ValueError(
+                "MultiConnector children require different persistent KV geometries"
+            )
+        return overrides[0] if overrides else None
+
+    def get_kv_cache_tensor_allocator(self):
+        allocators = [
+            allocator
+            for connector in self._connectors
+            if (allocator := connector.get_kv_cache_tensor_allocator()) is not None
+        ]
+        if len(allocators) > 1:
+            raise ValueError(
+                "Only one MultiConnector child may allocate KV cache tensors"
+            )
+        return allocators[0] if allocators else None
+
+    def get_kv_cache_block_provider(self) -> "KVCacheBlockProvider | None":
+        providers = [
+            provider
+            for connector in self._connectors
+            if (provider := connector.get_kv_cache_block_provider()) is not None
+        ]
+        if len(providers) > 1:
+            raise ValueError(
+                "Only one MultiConnector child may provide persistent KV blocks"
+            )
+        return providers[0] if providers else None
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]

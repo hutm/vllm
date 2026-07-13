@@ -4,7 +4,7 @@
 Define KV connector functionality mixin for model runners.
 """
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -17,7 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheTensor
 from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
@@ -32,6 +32,35 @@ logger = init_logger(__name__)
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
+    @staticmethod
+    def allocate_kv_cache_backing(
+        kv_cache_tensors: Sequence[KVCacheTensor],
+        size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Allocate one raw byte backing for one or more logical KV tensors."""
+        allocator = (
+            get_kv_transfer_group().get_kv_cache_tensor_allocator()
+            if has_kv_transfer_group()
+            else None
+        )
+        tensor = (
+            allocator(kv_cache_tensors, size, device)
+            if allocator is not None
+            else torch.zeros(size, dtype=torch.int8, device=device)
+        )
+        if (
+            tensor.dtype != torch.int8
+            or tensor.numel() != size
+            or not tensor.is_contiguous()
+            or tensor.device != device
+        ):
+            raise ValueError(
+                "invalid KV cache tensor allocator result: "
+                f"size={tensor.numel()}, dtype={tensor.dtype}, device={tensor.device}"
+            )
+        return tensor
+
     @staticmethod
     def kv_connector_no_forward(
         scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
@@ -231,7 +260,9 @@ class KVConnectorModelRunnerMixin:
 
         # allocate one contiguous buffer for all layers
         cross_layers_kv_cache = (
-            torch.zeros(total_size, dtype=torch.int8, device=device)
+            KVConnectorModelRunnerMixin.allocate_kv_cache_backing(
+                kv_cache_config.kv_cache_tensors, total_size, device
+            )
             .view(kv_cache_spec.dtype)
             .view(kv_cache_shape)
         )

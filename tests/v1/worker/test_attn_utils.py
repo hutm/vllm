@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
-from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor, KVQuantMode
+from vllm.v1.worker.gpu.attn_utils import _allocate_kv_cache, _reshape_kv_cache
+from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -240,3 +243,27 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache.stride(0) == spec.page_size_bytes
     assert kv_cache.stride(1) == 16 * 1 * 8
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
+
+
+def test_modular_runner_delegates_raw_kv_backing_allocation(monkeypatch):
+    logical = KVCacheTensor(size=8, shared_by=["layer"])
+    config = SimpleNamespace(
+        kv_cache_tensors=[logical],
+        kv_cache_groups=[SimpleNamespace(layer_names=["layer"])],
+    )
+    calls = []
+
+    def allocate(tensors, size, device):
+        calls.append((tensors, size, device))
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    monkeypatch.setattr(
+        KVConnectorModelRunnerMixin,
+        "allocate_kv_cache_backing",
+        staticmethod(allocate),
+    )
+
+    result = _allocate_kv_cache(config, {}, torch.device("cpu"))
+
+    assert result == {"layer": result["layer"]}
+    assert calls == [([logical], 8, torch.device("cpu"))]

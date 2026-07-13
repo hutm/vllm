@@ -7159,15 +7159,18 @@ class GPUModelRunner(
             if kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
                 if packed_backing is None:
-                    packed_backing = torch.zeros(
-                        kv_cache_tensor.size,
-                        dtype=torch.int8,
-                        device=self.device,
+                    packed_tensors = [
+                        tensor
+                        for tensor in kv_cache_config.kv_cache_tensors
+                        if tensor.block_stride > 0
+                    ]
+                    packed_backing = self.allocate_kv_cache_backing(
+                        packed_tensors, kv_cache_tensor.size, self.device
                     )
                 tensor = packed_backing
             else:
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                tensor = self.allocate_kv_cache_backing(
+                    [kv_cache_tensor], kv_cache_tensor.size, self.device
                 )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor

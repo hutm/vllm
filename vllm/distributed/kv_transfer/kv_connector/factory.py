@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.base import (
     KVConnectorBaseType,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    KVConnectorBase_V1,
     KVConnectorRole,
     supports_hma,
 )
@@ -73,6 +74,20 @@ class KVConnectorFactory:
         # - Should only be used inside the forward context & attention layer
         # We build separately to enforce strict separation
         return connector_cls(config, role, kv_cache_config)
+
+    @classmethod
+    def get_kv_cache_num_blocks_override(
+        cls,
+        config: "VllmConfig",
+    ) -> int | None:
+        """Return a connector's existing persistent-pool geometry, if any."""
+        kv_transfer_config = config.kv_transfer_config
+        if kv_transfer_config is None:
+            return None
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        if not issubclass(connector_cls, KVConnectorBase_V1):
+            return None
+        return connector_cls.get_kv_cache_num_blocks_override(config)
 
     @classmethod
     def get_connector_class_by_name(

@@ -12,6 +12,13 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_persistence import (
+    KVCacheBlockCandidate,
+    KVCacheBlockClaim,
+    KVCacheBlockProvider,
+    KVCacheBlockRecord,
+    KVCacheBlockUnavailable,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -166,6 +173,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        persistence_provider: KVCacheBlockProvider | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -194,6 +202,86 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.persistence_provider = persistence_provider
+        self._persistence_claims: dict[int, KVCacheBlockClaim] = {}
+        self._persistence_reservation: list[KVCacheBlockClaim] = []
+        if persistence_provider is not None:
+            persistence_provider.bind(
+                num_blocks=num_gpu_blocks,
+                reserved_block_ids=(self.null_block.block_id,),
+            )
+
+    def _persistence_candidate(self, block: KVCacheBlock) -> KVCacheBlockCandidate:
+        return KVCacheBlockCandidate(
+            block_id=block.block_id,
+            block_hash=block.block_hash,
+            num_tokens=block.block_hash_num_tokens,
+            claim=self._persistence_claims.get(block.block_id),
+        )
+
+    def _acquire_persistence_claims(
+        self, count: int
+    ) -> Sequence[KVCacheBlockClaim] | None:
+        provider = self.persistence_provider
+        assert provider is not None
+        candidate_ids: set[int] = set()
+
+        def candidates() -> Iterable[KVCacheBlockCandidate]:
+            for block in self.free_block_queue.iter_blocks_after(None):
+                if block.is_null:
+                    continue
+                candidate_ids.add(block.block_id)
+                yield self._persistence_candidate(block)
+
+        claims = provider.acquire(candidates(), count)
+        if claims is None:
+            return None
+        try:
+            self._validate_claims(claims, candidate_ids, count=count)
+        except Exception:
+            provider.rollback(claims)
+            raise
+        return claims
+
+    def reserve_persistence_claims(self, count: int) -> bool:
+        """Acquire physical blocks before request bookkeeping is mutated."""
+        if self.persistence_provider is None or count <= 0:
+            return True
+        if self._persistence_reservation:
+            raise RuntimeError("KV persistence reservation is already active")
+        claims = self._acquire_persistence_claims(count)
+        if claims is None:
+            return False
+        self._persistence_reservation = list(claims)
+        return True
+
+    def cancel_persistence_reservation(self) -> None:
+        """Release claims not consumed by the current allocation attempt."""
+        if not self._persistence_reservation:
+            return
+        provider = self.persistence_provider
+        assert provider is not None
+        claims, self._persistence_reservation = self._persistence_reservation, []
+        for claim in claims:
+            self._maybe_evict_cached_block(
+                self.blocks[claim.block_id], notify_persistence=False
+            )
+        provider.rollback(claims)
+
+    def _persistence_record(self, block: KVCacheBlock) -> KVCacheBlockRecord:
+        block_hash = block.block_hash
+        claim = self._persistence_claims.get(block.block_id)
+        if block_hash is None or claim is None:
+            raise AssertionError(
+                f"Block {block.block_id} has incomplete persistence state"
+            )
+        return KVCacheBlockRecord(
+            block_id=block.block_id,
+            block_hash=block_hash,
+            num_tokens=block.block_hash_num_tokens,
+            claim=claim,
+            aliases=tuple(self.cached_block_hashes_by_block.get(block.block_id, ())),
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -209,18 +297,112 @@ class BlockPool:
         Returns:
             The cached blocks if exists, or None.
         """
-        cached_blocks = []
-        for group_id in kv_cache_group_ids:
-            block_hash_with_group_id = make_block_hash_with_group_id(
-                block_hash, group_id
-            )
-            block = self.cached_block_hash_to_block.get_one_block(
-                block_hash_with_group_id
-            )
-            if not block:
+        block_hashes = [
+            make_block_hash_with_group_id(block_hash, group_id)
+            for group_id in kv_cache_group_ids
+        ]
+        cached_blocks = [
+            self.cached_block_hash_to_block.get_one_block(key) for key in block_hashes
+        ]
+        recovered = any(block is None for block in cached_blocks)
+        if recovered:
+            if not self._recover_persisted_blocks(block_hashes):
                 return None
-            cached_blocks.append(block)
-        return cached_blocks
+            cached_blocks = [
+                self.cached_block_hash_to_block.get_one_block(key)
+                for key in block_hashes
+            ]
+
+        blocks = [block for block in cached_blocks if block is not None]
+        if len(blocks) != len(block_hashes):
+            return None
+
+        provider = self.persistence_provider
+        if provider is None or recovered:
+            # ``recover`` already returned owned claims for these blocks.
+            return blocks
+        records = [self._persistence_record(block) for block in blocks]
+        claims = provider.activate(records)
+        if claims is None:
+            for block in blocks:
+                self._maybe_evict_cached_block(block)
+            return None
+        self._validate_claims(claims, {block.block_id for block in blocks})
+        for claim in claims:
+            self._persistence_claims[claim.block_id] = claim
+        return blocks
+
+    @staticmethod
+    def _validate_claims(
+        claims: Sequence[KVCacheBlockClaim],
+        candidate_ids: set[int],
+        count: int | None = None,
+    ) -> None:
+        expected = len(candidate_ids) if count is None else count
+        claim_ids = [claim.block_id for claim in claims]
+        if (
+            len(claim_ids) != expected
+            or len(set(claim_ids)) != len(claim_ids)
+            or any(block_id not in candidate_ids for block_id in claim_ids)
+        ):
+            raise ValueError("KV cache provider returned invalid block claims")
+
+    def _recover_persisted_blocks(
+        self, block_hashes: Sequence[BlockHashWithGroupId]
+    ) -> bool:
+        provider = self.persistence_provider
+        if provider is None:
+            return False
+        records = provider.recover(block_hashes)
+        if records is None or len(records) != len(block_hashes):
+            return False
+
+        block_ids = {record.block_id for record in records}
+        claims = [record.claim for record in records]
+        try:
+            self._validate_claims(claims, block_ids)
+        except Exception:
+            provider.discard(records, release_claims=True)
+            raise
+        if any(
+            record.block_hash != expected_hash
+            or record.claim.block_id != record.block_id
+            for record, expected_hash in zip(records, block_hashes)
+        ):
+            provider.discard(records, release_claims=True)
+            return False
+
+        blocks = []
+        for record in records:
+            if not 0 < record.block_id < len(self.blocks):
+                provider.discard(records, release_claims=True)
+                return False
+            block = self.blocks[record.block_id]
+            if block.ref_cnt != 0 or block.block_hash is not None:
+                provider.discard(records, release_claims=True)
+                return False
+            blocks.append(block)
+
+        installed: list[KVCacheBlock] = []
+        try:
+            for block, record in zip(blocks, records):
+                self.free_block_queue.remove(block)
+                installed.append(block)
+                self._insert_block_hash(
+                    record.block_hash,
+                    block,
+                    num_tokens=record.num_tokens,
+                )
+                self._persistence_claims[block.block_id] = record.claim
+            self.free_block_queue.append_n(installed)
+            return True
+        except Exception:
+            for block in installed:
+                self._remove_cached_block_hashes(block)
+                self._persistence_claims.pop(block.block_id, None)
+            self.free_block_queue.append_n(installed)
+            provider.discard(records, release_claims=True)
+            raise
 
     def cache_full_blocks(
         self,
@@ -640,6 +822,16 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        provider = self.persistence_provider
+        if (
+            provider is not None
+            and src_block.block_hash is not None
+            and src_block.block_id in self._persistence_claims
+        ):
+            # The source is about to be overwritten after the COW copy.
+            provider.discard(
+                [self._persistence_record(src_block)], release_claims=False
+            )
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
@@ -655,28 +847,72 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.get_num_free_blocks():
-            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        has_reservation = (
+            self.persistence_provider is not None
+            and len(self._persistence_reservation) >= num_blocks
+        )
+        available = (
+            self.free_block_queue.num_free_blocks
+            if has_reservation
+            else self.get_num_free_blocks()
+        )
+        if num_blocks > available:
+            raise KVCacheBlockUnavailable(
+                f"Cannot get {num_blocks} free blocks from the pool"
+            )
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
-
-        # In order to only iterate the list once, we duplicated code a bit
-        if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+        provider = self.persistence_provider
+        claims: Sequence[KVCacheBlockClaim] | None = None
+        if provider is None:
+            ret = self.free_block_queue.popleft_n(num_blocks)
         else:
+            if has_reservation:
+                claims = self._persistence_reservation[:num_blocks]
+                del self._persistence_reservation[:num_blocks]
+            else:
+                claims = self._acquire_persistence_claims(num_blocks)
+            if claims is None:
+                raise KVCacheBlockUnavailable(
+                    f"External provider cannot acquire {num_blocks} blocks"
+                )
+            ret = [self.blocks[claim.block_id] for claim in claims]
             for block in ret:
+                if block.ref_cnt != 0 or block.is_null:
+                    provider.rollback(claims)
+                    raise ValueError(
+                        "KV cache provider selected a block that is not locally free"
+                    )
+            for block in ret:
+                self.free_block_queue.remove(block)
+
+        try:
+            for block in ret:
+                if self.enable_caching:
+                    self._maybe_evict_cached_block(block, notify_persistence=False)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
-        return ret
+            if claims is not None:
+                for claim in claims:
+                    self._persistence_claims[claim.block_id] = claim
+            return ret
+        except Exception:
+            for block in ret:
+                if block.ref_cnt > 0:
+                    block.ref_cnt -= 1
+                self._persistence_claims.pop(block.block_id, None)
+            self.free_block_queue.prepend_n(ret)
+            if provider is not None and claims is not None:
+                provider.rollback(claims)
+            raise
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(
+        self,
+        block: KVCacheBlock,
+        *,
+        notify_persistence: bool = True,
+    ) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
@@ -687,6 +923,20 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        if (
+            notify_persistence
+            and self.persistence_provider is not None
+            and block.block_hash is not None
+            and block.block_id in self._persistence_claims
+        ):
+            release_claim = block.ref_cnt == 0
+            self.persistence_provider.discard(
+                [self._persistence_record(block)],
+                release_claims=release_claim,
+            )
+            if release_claim:
+                self._persistence_claims.pop(block.block_id, None)
+
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -735,6 +985,20 @@ class BlockPool:
                 else:
                     blocks_with_hash.append(block)
 
+        provider = self.persistence_provider
+        if provider is not None:
+            if blocks_with_hash:
+                provider.commit(
+                    [self._persistence_record(block) for block in blocks_with_hash]
+                )
+            claims = [
+                self._persistence_claims.pop(block.block_id)
+                for block in blocks_without_hash
+                if block.block_id in self._persistence_claims
+            ]
+            if claims:
+                provider.release(claims)
+
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
@@ -767,7 +1031,7 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -775,6 +1039,26 @@ class BlockPool:
                 num_used_blocks - 1,
             )
             return False
+
+        provider = self.persistence_provider
+        if provider is not None:
+            records = [
+                self._persistence_record(block)
+                for block in self.blocks
+                if block.block_hash is not None
+                and block.block_id in self._persistence_claims
+            ]
+            if records:
+                provider.discard(records, release_claims=True)
+            record_ids = {record.block_id for record in records}
+            remaining = [
+                claim
+                for block_id, claim in self._persistence_claims.items()
+                if block_id not in record_ids
+            ]
+            if remaining:
+                provider.release(remaining)
+            self._persistence_claims.clear()
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
@@ -800,7 +1084,18 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        native_free_blocks = self.free_block_queue.num_free_blocks
+        if self.persistence_provider is None:
+            return native_free_blocks
+        return min(
+            native_free_blocks,
+            self.persistence_provider.get_num_available(native_free_blocks),
+        )
+
+    def flush_persistence(self) -> None:
+        """Make accepted provider metadata durable before a clean handoff."""
+        if self.persistence_provider is not None:
+            self.persistence_provider.flush()
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

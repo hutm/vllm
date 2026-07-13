@@ -11,6 +11,10 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_persistence import (
+    KVCacheBlockProvider,
+    KVCacheBlockUnavailable,
+)
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -126,6 +130,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        persistence_provider: KVCacheBlockProvider | None = None,
         watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
@@ -157,6 +162,7 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            persistence_provider=persistence_provider,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -451,25 +457,34 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-            )
+        if not self.block_pool.reserve_persistence_claims(num_blocks_to_allocate):
+            return None
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Physical capacity is reserved, so appending externally
+                # computed blocks cannot leave partial state on contention.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
+
+            try:
+                new_blocks = self.coordinator.allocate_new_blocks(
+                    request.request_id,
+                    num_tokens_need_slot,
+                    num_tokens_main_model,
+                    num_encoder_tokens,
+                )
+            except KVCacheBlockUnavailable:
+                return None
+        finally:
+            self.block_pool.cancel_persistence_reservation()
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

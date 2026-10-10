@@ -140,3 +140,62 @@ class DummyBackend(SleepModeBackend):
     @classmethod
     def supports_durable_storage(cls) -> bool:
         return True
+
+
+def test_backends_do_not_preserve_kv_cache_by_default():
+    # cumem unmaps KV memory at level 1+, so the prefix cache must be reset.
+    assert SleepModeBackend.preserves_kv_cache() is False
+    assert CuMemBackend.preserves_kv_cache() is False
+
+
+class _KVPreservingBackend(CuMemBackend):
+    @classmethod
+    def preserves_kv_cache(cls, level: int = 1) -> bool:
+        return True
+
+
+@pytest.fixture
+def kv_preserving_backend():
+    name = "test-kv-preserving"
+    SleepModeBackendFactory._registry.pop(name, None)
+    SleepModeBackendFactory.register_backend(
+        name, __name__, _KVPreservingBackend.__name__
+    )
+    yield name
+    SleepModeBackendFactory._registry.pop(name, None)
+
+
+def _sleep_decision(backend: str, level: int, clear_cache: bool | None) -> bool:
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCore
+
+    core = object.__new__(EngineCore)
+    core.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(sleep_mode_backend=backend)
+    )
+    return core._sleep_clears_prefix_cache(level, clear_cache)
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_sleep_resets_prefix_cache_when_backend_discards_kv(level):
+    assert _sleep_decision("cumem", level, None) is True
+    assert _sleep_decision("cumem", level, True) is True
+    with pytest.raises(ValueError, match="preserves KV cache contents"):
+        _sleep_decision("cumem", level, False)
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_sleep_keeps_prefix_cache_when_backend_preserves_kv(
+    kv_preserving_backend, level
+):
+    assert _sleep_decision(kv_preserving_backend, level, None) is False
+    assert _sleep_decision(kv_preserving_backend, level, False) is False
+    # Callers can still ask for a reset, e.g. before loading new weights.
+    assert _sleep_decision(kv_preserving_backend, level, True) is True
+
+
+def test_level_zero_sleep_only_clears_when_asked():
+    assert _sleep_decision("cumem", 0, None) is False
+    assert _sleep_decision("cumem", 0, False) is False
+    assert _sleep_decision("cumem", 0, True) is True

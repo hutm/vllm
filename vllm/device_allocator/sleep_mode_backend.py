@@ -107,6 +107,18 @@ class SleepModeBackend(ABC):
         return False
 
     @classmethod
+    def preserves_kv_cache(cls, level: int = 1) -> bool:
+        """If True, KV cache contents survive ``suspend(level)`` and
+        ``resume`` bit-exact, so the engine may keep its prefix cache (block
+        hashes and free-block metadata) across sleep instead of resetting it.
+
+        A backend that unmaps or discards KV memory must return False. Backends
+        that keep KV memory mapped, back it with memory owned outside the
+        process, or offload and restore it can return True.
+        """
+        return False
+
+    @classmethod
     def supports_durable_storage(cls) -> bool:
         """If True, suspended state can be persisted beyond the process
         lifetime (disk or object storage) and restored in a new process."""

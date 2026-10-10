@@ -4,7 +4,7 @@
 from collections.abc import Callable
 from dataclasses import field
 from functools import cache
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,6 +15,9 @@ from vllm.utils.torch_utils import (
     kv_cache_uses_per_token_head_scales,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
 
@@ -274,6 +277,34 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    block_pool_cls: str | None = None
+    """The KV cache block pool class, as the path to a class of form
+    "mod.custom_class". It must subclass ``vllm.v1.core.block_pool.BlockPool``
+    and may override its lifecycle hooks (``on_blocks_allocated``,
+    ``on_blocks_released``, ``on_cached_block_evicted``,
+    ``on_blocks_cached``). Defaults to ``BlockPool``."""
+
+    def get_block_pool_cls(self) -> type["BlockPool"]:
+        """Resolve ``block_pool_cls`` to a ``BlockPool`` subclass."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+        from vllm.v1.core.block_pool import BlockPool
+
+        if self.block_pool_cls is None:
+            return BlockPool
+        block_pool_cls = resolve_obj_by_qualname(self.block_pool_cls)
+        if not (
+            isinstance(block_pool_cls, type) and issubclass(block_pool_cls, BlockPool)
+        ):
+            raise ValueError(
+                f"block_pool_cls {self.block_pool_cls!r} is not a BlockPool subclass."
+            )
+        logger.warning_once(
+            "Using custom KV cache block pool class %s. The BlockPool hook "
+            "interface is experimental and may change.",
+            self.block_pool_cls,
+        )
+        return block_pool_cls
+
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
@@ -292,6 +323,8 @@ class CacheConfig:
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
+            # Scheduler-side block bookkeeping; no effect on the model graph.
+            "block_pool_cls",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).

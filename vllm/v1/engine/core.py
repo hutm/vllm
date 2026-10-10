@@ -917,6 +917,10 @@ class EngineCore:
         self.model_executor.collective_rpc("synchronize_device")
         if clear_cache:
             self._reset_caches()
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        if block_pool is not None:
+            block_pool.on_scheduler_paused()
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True

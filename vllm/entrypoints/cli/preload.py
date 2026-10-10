@@ -39,6 +39,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     check_ipc_platform_support,
 )
+from vllm.model_executor.model_loader.weight_cache.vmm import (
+    CUDA_IPC,
+    WEIGHT_CACHE_TRANSPORTS,
+)
 from vllm.utils.network_utils import get_distributed_init_method, get_open_port
 
 if typing.TYPE_CHECKING:
@@ -112,6 +116,16 @@ class PreloadSubcommand(CLISubcommand):
             type=str,
             default=None,
             help="Directory for the daemon Unix sockets (default: tempdir).",
+        )
+        parser.add_argument(
+            "--weight-cache-transport",
+            choices=WEIGHT_CACHE_TRANSPORTS,
+            default=CUDA_IPC,
+            help="How engines map the cached weights. cuda_ipc exports PyTorch "
+            "CUDA IPC handles. vmm_fd packs the weights into one shareable CUDA "
+            "VMM allocation passed as a file descriptor; each engine then holds "
+            "its own reference to the memory. vmm_fd needs CUDA and briefly "
+            "uses twice the model's memory while packing.",
         )
         parser.add_argument(
             "--weight-cache-master-port",
@@ -254,6 +268,7 @@ class PreloadSubcommand(CLISubcommand):
                     is_draft,
                     dp_rank,
                     pp_rank,
+                    args.weight_cache_transport,
                 ),
                 name=(
                     f"vllm-weight-cache-{format_daemon_role(is_draft)}-"

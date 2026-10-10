@@ -227,6 +227,43 @@ def test_ipc_cache_cold_start_and_warm_restart(vllm_runner, case: ModelCase):
     assert restart_outputs == baseline_outputs
 
 
+def test_vmm_fd_engine_keeps_serving_after_daemon_dies(vllm_runner):
+    """With --weight-cache-transport vmm_fd the engine holds its own reference
+    to the cached weights, so it keeps producing the same outputs after the
+    daemon is killed."""
+    if not current_platform.is_cuda():
+        pytest.skip("vmm_fd needs CUDA VMM")
+    case = ModelCase(
+        model="Qwen/Qwen3-0.6B",
+        prompts=["Hello, my name is", "The capital of France is"],
+        llm_kwargs=dict(gpu_memory_utilization=0.3, enforce_eager=True),
+    )
+    baseline_outputs = generate(vllm_runner, case, None, fallback=True)
+    sampling_params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+    with (
+        WeightCacheDaemon(
+            case.model,
+            tp_size=1,
+            extra_args=["--weight-cache-transport", "vmm_fd"],
+        ) as d,
+        vllm_runner(
+            case.model,
+            load_format="ipc_cache",
+            model_loader_extra_config={"socket_dir": d.socket_dir, "fallback": False},
+            max_num_seqs=1,
+            **case.llm_kwargs,
+        ) as llm,
+    ):
+        warm_outputs = llm.generate(case.prompts, sampling_params)
+        assert d._proc is not None
+        d._proc.kill()
+        d._proc.wait(timeout=60)
+        after_kill_outputs = llm.generate(case.prompts, sampling_params)
+
+    assert warm_outputs == baseline_outputs
+    assert after_kill_outputs == baseline_outputs
+
+
 def _parallel(**kw):
     from types import SimpleNamespace
 

@@ -139,8 +139,9 @@ llm.wake_up(tags=["kv_cache"])  # Reallocate KV cache and resume scheduling.
 By default, CUDA graph memory stays on the GPU while asleep. With
 `sleep_mode_offload_cudagraph=True` (off by default), CUDA graphs are captured
 into a cuMem pool that sleep backs up to CPU memory at both levels and any wake
-restores in place, so graphs are replayed, not recaptured. It needs the default
-`cumem` backend, CUDA or ROCm, and CUDA graphs; otherwise it has no effect.
+restores in place, so graphs are replayed, not recaptured. It needs a cuMem
+backend (`cumem` or `cumem_offload_kv`), CUDA or ROCm, and CUDA graphs;
+otherwise it has no effect.
 
 ```python
 llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, sleep_mode_offload_cudagraph=True)
@@ -172,7 +173,9 @@ or `vllm serve <model> --enable-sleep-mode --enable-nccl-comm-suspend`.
 #### Choosing a sleep-mode backend
 
 `sleep_mode_backend` selects how GPU memory is freed and restored. The default
-is the built-in `cumem` backend. Plugins can register other backends with
+is the built-in `cumem` backend. The built-in `cumem_offload_kv` backend also
+offloads the KV cache at level 1, so the prefix cache survives sleep. Plugins
+can register other backends with
 `SleepModeBackendFactory.register_backend` from a `vllm.general_plugins` entry
 point, and you select one by name:
 

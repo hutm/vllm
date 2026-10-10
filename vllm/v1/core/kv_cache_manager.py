@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -146,6 +147,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        block_pool_cls: type[BlockPool] | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -177,6 +179,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            block_pool_cls=block_pool_cls,
         )
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused

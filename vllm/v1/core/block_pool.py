@@ -270,6 +270,7 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        newly_cached: list[KVCacheBlock] = []
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -299,6 +300,10 @@ class BlockPool:
             )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+            newly_cached.append(blk)
+
+        if newly_cached:
+            self.on_blocks_cached(newly_cached, kv_cache_group_id)
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -679,6 +684,13 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        try:
+            self.on_blocks_allocated(ret)
+        except BaseException:
+            # The hook vetoed the allocation (e.g. capacity owned outside this
+            # pool is exhausted); hand the blocks back untouched.
+            self.free_block_queue.prepend_n(ret)
+            raise
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -747,6 +759,7 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        self.on_cached_block_evicted(block, evicted_hashes)
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
@@ -801,6 +814,8 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if blocks_to_evict_first or blocks_to_evict_last:
+            self.on_blocks_released(blocks_to_evict_first + blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
@@ -864,6 +879,47 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    # -- Lifecycle hooks -------------------------------------------------------
+    # No-ops here. A pool selected with ``--block-pool-cls`` overrides them to
+    # observe the KV block lifecycle, e.g. to account for KV memory owned
+    # outside this process or to keep an external index of cached blocks.
+    # They run synchronously on the scheduler thread and must be cheap.
+
+    def on_blocks_allocated(self, blocks: list[KVCacheBlock]) -> None:
+        """Called after ``get_new_blocks`` takes ``blocks`` off the free queue,
+        before any of them is evicted from the prefix cache or handed out.
+
+        Raising vetoes the allocation: the blocks go back to the free queue
+        unchanged and the exception propagates to the caller. Pair a veto with
+        an overridden ``get_num_free_blocks`` so the scheduler sees the same
+        capacity limit before it allocates.
+        """
+
+    def on_blocks_released(self, blocks: list[KVCacheBlock]) -> None:
+        """Called after ``free_blocks`` drops the last reference to ``blocks``
+        and returns them to the free queue. Cached blocks keep their hashes
+        and stay reusable until evicted."""
+
+    def on_cached_block_evicted(
+        self, block: KVCacheBlock, block_hashes: list[BlockHashWithGroupId]
+    ) -> None:
+        """Called after ``block`` loses its prefix-cache entries
+        ``block_hashes`` because it is reused for new data or evicted with
+        ``evict_blocks``. ``reset_prefix_cache`` clears every entry without
+        per-block calls; override it to observe a full reset."""
+
+    def on_blocks_cached(
+        self, blocks: list[KVCacheBlock], kv_cache_group_id: int
+    ) -> None:
+        """Called after ``cache_full_blocks`` adds ``blocks`` (full blocks of
+        group ``kv_cache_group_id``) to the prefix cache."""
+
+    def on_scheduler_paused(self) -> None:
+        """Called when a pause (``pause_scheduler`` or ``sleep``) completes:
+        in-flight work has drained and the device is idle, before any sleep
+        frees memory. Flush external bookkeeping that must be complete
+        before the engine sleeps."""
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.

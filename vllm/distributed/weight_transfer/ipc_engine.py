@@ -52,11 +52,25 @@ class IPCTrainerInitInfo(TrainerInitInfo):
 
     `packed` / `packed_buffer_size_bytes` are the transfer's wire params. The
     trainer propagates `packed` to the worker at `trainer_init` so the two sides
-    cannot disagree. `backend` is the factory dispatch key."""
+    cannot disagree. `backend` is the factory dispatch key.
+
+    `packed_transport="vmm_fd"` shares the packed buffer as a CUDA VMM
+    allocation whose fd the worker fetches from a private Unix socket, instead
+    of a `reduce_tensor` handle. Workers detect it from the handle."""
 
     backend: ClassVar[str] = "ipc"
     packed: bool = False
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
+    packed_transport: str = "cuda_ipc"
+
+    def __post_init__(self):
+        if self.packed_transport not in ("cuda_ipc", "vmm_fd"):
+            raise ValueError(
+                f"Unknown packed_transport {self.packed_transport!r}; "
+                "expected 'cuda_ipc' or 'vmm_fd'"
+            )
+        if self.packed_transport == "vmm_fd" and not self.packed:
+            raise ValueError("packed_transport='vmm_fd' requires packed=True")
 
 
 @dataclass
@@ -272,10 +286,12 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
         is_sender: bool = True,
         packed: bool = False,
         packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+        packed_transport: str = "cuda_ipc",
     ) -> None:
         super().__init__(client=client, source=source, is_sender=is_sender)
         self.packed = packed
         self.packed_buffer_size_bytes = packed_buffer_size_bytes
+        self.packed_transport = packed_transport
         self.device_index = torch.accelerator.current_device_index()
         self.gpu_uuid = str(torch.cuda.get_device_properties(self.device_index).uuid)
 
@@ -295,6 +311,7 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
             is_sender=init_info.is_sender,
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
+            packed_transport=init_info.packed_transport,
         )
         # IPC needs no data-plane rendezvous. The sender ships the must-agree
         # `packed` flag so the worker decodes exactly as this trainer encodes.
@@ -414,6 +431,7 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
             gpu_uuid=self.gpu_uuid,
             post_iter_func=lambda item: item[1],
             buffer_size_bytes=self.packed_buffer_size_bytes,
+            vmm_fd=self.packed_transport == "vmm_fd",
         ):
             ipc_handle = self._all_gather_and_merge_handles([chunk.ipc_handle])[0]
             self._do_send(

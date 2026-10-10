@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
@@ -42,6 +44,30 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+_PRESERVE_KV_CACHE_CONTENTS: ContextVar[bool] = ContextVar(
+    "vllm_preserve_kv_cache_contents", default=False
+)
+
+
+@contextmanager
+def preserve_kv_cache_contents() -> Iterator[None]:
+    """Allocate the KV cache without zero-filling it.
+
+    For allocators that hand back KV memory whose contents are already valid,
+    e.g. memory restored from, or owned by, another process. Only the
+    initial fill is skipped; block reuse still follows ``needs_kv_cache_zeroing``.
+    """
+    token = _PRESERVE_KV_CACHE_CONTENTS.set(True)
+    try:
+        yield
+    finally:
+        _PRESERVE_KV_CACHE_CONTENTS.reset(token)
+
+
+def kv_cache_contents_preserved() -> bool:
+    """Whether the current KV cache allocation must keep existing contents."""
+    return _PRESERVE_KV_CACHE_CONTENTS.get()
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -593,7 +619,8 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    alloc = torch.empty if kv_cache_contents_preserved() else torch.zeros
+    buf = alloc(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:

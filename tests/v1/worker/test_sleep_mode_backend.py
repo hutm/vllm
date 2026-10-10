@@ -199,3 +199,138 @@ def test_level_zero_sleep_only_clears_when_asked():
     assert _sleep_decision("cumem", 0, None) is False
     assert _sleep_decision("cumem", 0, False) is False
     assert _sleep_decision("cumem", 0, True) is True
+
+
+def _single_buffer_kv_cache_config(size: int):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        kv_cache_tensors=[SimpleNamespace(size=size, layers=["layer.0"])],
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=["layer.0"],
+                kv_cache_spec=SimpleNamespace(has_layer_views=False),
+            )
+        ],
+    )
+
+
+def test_kv_cache_allocation_zero_fills_by_default(monkeypatch):
+    import torch
+
+    from vllm.v1.worker import utils
+
+    monkeypatch.setattr(
+        utils.torch, "empty", lambda *a, **k: pytest.fail("must zero-fill")
+    )
+    caches = utils.allocate_kv_cache(
+        _single_buffer_kv_cache_config(64), torch.device("cpu"), layout=None
+    )
+    assert torch.count_nonzero(caches["layer.0"]) == 0
+
+
+def test_kv_cache_allocation_keeps_preserved_contents(monkeypatch):
+    import torch
+
+    from vllm.v1.worker import utils
+
+    monkeypatch.setattr(
+        utils.torch, "zeros", lambda *a, **k: pytest.fail("must not zero-fill")
+    )
+    with utils.preserve_kv_cache_contents():
+        assert utils.kv_cache_contents_preserved()
+        caches = utils.allocate_kv_cache(
+            _single_buffer_kv_cache_config(64), torch.device("cpu"), layout=None
+        )
+    assert not utils.kv_cache_contents_preserved()
+    assert caches["layer.0"].numel() == 64
+
+
+def _worker_with_backend(backend, *, enable_sleep_mode=True):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_worker import Worker
+
+    worker = object.__new__(Worker)
+    worker._sleep_mode_backend = backend
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enable_sleep_mode=enable_sleep_mode, enable_cumem_allocator=False
+        )
+    )
+    return worker
+
+
+def test_worker_allocates_inside_backend_allocation_context():
+    from contextlib import nullcontext
+
+    seen = []
+    placed = nullcontext()
+
+    class Backend:
+        def allocation_context(self, tag, *, kv_cache_config=None):
+            seen.append((tag, kv_cache_config))
+            return placed
+
+    worker = _worker_with_backend(Backend())
+    kv_config = object()
+    assert (
+        worker._maybe_get_memory_pool_context("kv_cache", kv_cache_config=kv_config)
+        is placed
+    )
+    assert worker._maybe_get_memory_pool_context("weights") is placed
+    assert seen == [("kv_cache", kv_config), ("weights", None)]
+
+
+def test_worker_falls_back_when_backend_declines_a_tag(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm.v1.worker import gpu_worker
+
+    class Backend:
+        def allocation_context(self, tag, *, kv_cache_config=None):
+            return None
+
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    worker = _worker_with_backend(Backend())
+    # cumem allocator disabled -> the default path is a plain allocation.
+    assert isinstance(worker._maybe_get_memory_pool_context("kv_cache"), nullcontext)
+
+
+def test_worker_ignores_backend_without_sleep_mode(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm.v1.worker import gpu_worker
+
+    class Backend:
+        def allocation_context(self, tag, *, kv_cache_config=None):
+            pytest.fail("backend must not be consulted without sleep mode")
+
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    worker = _worker_with_backend(Backend(), enable_sleep_mode=False)
+    assert isinstance(worker._maybe_get_memory_pool_context("kv_cache"), nullcontext)
+
+
+class _SelfAllocatingBackend(CuMemBackend):
+    @classmethod
+    def requires_cumem_allocator(cls) -> bool:
+        return False
+
+
+def test_cumem_allocator_requirement_follows_the_backend():
+    name = "test-self-allocating"
+    SleepModeBackendFactory._registry.pop(name, None)
+    SleepModeBackendFactory.register_backend(
+        name, __name__, _SelfAllocatingBackend.__name__
+    )
+    try:
+        assert SleepModeBackendFactory.requires_cumem_allocator("cumem") is True
+        assert SleepModeBackendFactory.requires_cumem_allocator(name) is False
+        # A plugin backend not registered yet keeps today's behavior.
+        assert SleepModeBackendFactory.requires_cumem_allocator("unknown") is True
+    finally:
+        SleepModeBackendFactory._registry.pop(name, None)
+
+
+def test_default_backend_allocation_context_is_unset():
+    assert CuMemBackend().allocation_context("kv_cache") is None

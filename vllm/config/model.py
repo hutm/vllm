@@ -655,7 +655,17 @@ class ModelConfig:
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
-            if current_platform.is_cuda_alike() and not self.enable_cumem_allocator:
+            from vllm.device_allocator.sleep_mode_backend import (
+                SleepModeBackendFactory,
+            )
+
+            if (
+                current_platform.is_cuda_alike()
+                and not self.enable_cumem_allocator
+                and SleepModeBackendFactory.requires_cumem_allocator(
+                    self.sleep_mode_backend
+                )
+            ):
                 logger.info_once(
                     "Enabling cumem allocator because sleep mode requires it."
                 )

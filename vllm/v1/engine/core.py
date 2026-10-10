@@ -956,7 +956,38 @@ class EngineCore:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
-    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
+    def _sleep_clears_prefix_cache(self, level: int, clear_cache: bool | None) -> bool:
+        """Resolve whether ``sleep(level)`` must reset the prefix cache.
+
+        Level 0 never touches GPU memory. Level 1+ resets the prefix cache
+        unless the sleep-mode backend declares that KV contents survive
+        suspend/resume; a caller may still ask for a reset explicitly.
+        """
+        if level < 1:
+            return bool(clear_cache)
+        from vllm.device_allocator.sleep_mode_backend import (
+            SleepModeBackendFactory,
+        )
+
+        backend = self.vllm_config.model_config.sleep_mode_backend
+        preserves_kv = SleepModeBackendFactory.get_backend_class(
+            backend
+        ).preserves_kv_cache(level)
+        if clear_cache is None:
+            return not preserves_kv
+        if not clear_cache and not preserves_kv:
+            raise ValueError(
+                f"sleep(level={level}, clear_cache=False) requires a sleep-mode "
+                f"backend that preserves KV cache contents; {backend!r} does not."
+            )
+        return clear_cache
+
+    def sleep(
+        self,
+        level: int = 1,
+        mode: PauseMode = "abort",
+        clear_cache: bool | None = None,
+    ) -> None | Future:
         """Put the engine to sleep at the specified level.
 
         Args:
@@ -967,10 +998,14 @@ class EngineCore:
                 - Level 2: Discard all GPU memory.
             mode: Pause mode - how to deal with any existing requests, see
                 documentation of pause_scheduler method.
+            clear_cache: Whether to reset the prefix cache. ``None`` resets it
+                for level 1+ unless the sleep-mode backend preserves KV cache
+                contents (``SleepModeBackend.preserves_kv_cache``). ``False``
+                at level 1+ requires such a backend.
 
         """
         # Pause scheduler before sleeping.
-        clear_prefix_cache = level >= 1
+        clear_prefix_cache = self._sleep_clears_prefix_cache(level, clear_cache)
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
         if level < 1:
             return pause_future

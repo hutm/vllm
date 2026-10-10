@@ -195,8 +195,14 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
-        """Sleep the engine."""
+    async def sleep(
+        self,
+        level: int = 1,
+        mode: "PauseMode" = "abort",
+        clear_cache: bool | None = None,
+    ) -> None:
+        """Sleep the engine. ``clear_cache=None`` resets the prefix cache at
+        level 1+ unless the sleep-mode backend preserves KV cache contents."""
         ...
 
     @abstractmethod

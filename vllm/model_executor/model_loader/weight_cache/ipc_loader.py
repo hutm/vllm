@@ -5,6 +5,7 @@ daemon via CUDA IPC instead of loading from disk."""
 
 import contextlib
 import dataclasses
+import os
 import socket
 import threading
 import time
@@ -24,6 +25,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.load import LoadConfig
+from vllm.device_allocator.cuda_vmm import ShareableAllocation, recv_fd
 from vllm.distributed import (
     get_dp_group,
     get_pp_group,
@@ -55,6 +57,7 @@ from vllm.model_executor.model_loader.weight_cache.protocol import (
 from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
+from vllm.model_executor.model_loader.weight_cache.vmm import VMM_FD
 from vllm.model_executor.utils import weights_already_processed
 from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -66,6 +69,10 @@ _STATE_TIMEOUT_S = 300.0
 _STARTUP_RETRY_INTERVAL_S = 0.5
 
 _T = TypeVar("_T")
+
+# Weight arenas mapped with the vmm_fd transport. Zero-copy models reference
+# this memory for the life of the process.
+_MAPPED_ARENAS: list[ShareableAllocation] = []
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -90,8 +97,9 @@ class IpcModelLoader(BaseModelLoader):
     - state_timeout_s: timeout for the weight-transfer request (default: 300.0).
 
     Note: in zero-copy mode the weights live in the daemon's CUDA IPC
-    allocations, so sleep mode (CuMemAllocator weight offloading) must not be
-    used with this loader. If the daemon exits, the CUDA driver keeps the
+    allocations (or, with the daemon's ``vmm_fd`` transport, in its shared
+    VMM allocation), so sleep mode (CuMemAllocator weight offloading) must not
+    be used with this loader. If the daemon exits, the CUDA driver keeps the
     mapped weights alive until the engine exits, so the engine keeps serving;
     the loader watches the daemon and warns since a restarted daemon then holds
     a second copy of the weights on the GPU.
@@ -195,24 +203,26 @@ class IpcModelLoader(BaseModelLoader):
         cache_key = self._cache_key
         if cache_key is None:
             vllm_config = get_current_vllm_config()
-            entries = self._fetch_entries(
+            state = self._fetch_entries(
                 model_config,
                 vllm_config.cache_config,
                 vllm_config.parallel_config,
                 vllm_config.kernel_config,
                 is_reload=True,
-            ).entries
+            )
         else:
-            entries = self._state_for_key(cache_key, is_reload=True).entries
+            state = self._state_for_key(cache_key, is_reload=True)
         params = dict(model.named_parameters())
         buffers = dict(model.named_buffers())
-        for name, entry in entries.items():
+        for name, entry in state.entries.items():
             target = params.get(name, buffers.get(name))
-            source = entry.rebuild(device_index)
+            source = entry.rebuild(device_index, state.allocation)
             if target is None or target.shape != source.shape:
                 logger.warning("Skipping mismatched cached tensor %s", name)
                 continue
             target.data.copy_(source)
+        if state.allocation is not None:
+            state.allocation.close()
 
     @instrument(span_name="Load model")
     def load_model(
@@ -314,6 +324,11 @@ class IpcModelLoader(BaseModelLoader):
             _materialize_remaining_meta_tensors(
                 model, torch.device(target_device.type, device_index)
             )
+        if state.allocation is not None:
+            if self.mode == "copy":
+                state.allocation.close()
+            else:
+                _MAPPED_ARENAS.append(state.allocation)
         if self.mode == "copy":
             self._send_release()
         else:
@@ -360,7 +375,7 @@ class IpcModelLoader(BaseModelLoader):
             registered[name] = obj
 
         for name, entry in state.entries.items():
-            tensor = entry.rebuild(device_index)
+            tensor = entry.rebuild(device_index, state.allocation)
             if self.mode == "copy":
                 tensor = tensor.clone()
             _register(name, tensor, entry.kind == "param")
@@ -452,6 +467,7 @@ class IpcModelLoader(BaseModelLoader):
     def _request_state(
         self, cache_key: WeightCacheKey, *, is_reload: bool = False
     ) -> WeightCacheState:
+        allocation = None
         with self._connect(self.state_timeout_s) as conn:
             send_msg(
                 conn,
@@ -462,6 +478,19 @@ class IpcModelLoader(BaseModelLoader):
                 },
             )
             response = recv_msg(conn)
+            if response.get("status") == "ok" and response.get("transport") == VMM_FD:
+                # The daemon packed its weights into one shareable allocation
+                # and sent its fd; map it. This process then holds its own
+                # reference, so the mapping outlives the daemon.
+                fd = recv_fd(conn)
+                try:
+                    allocation = ShareableAllocation.import_fd(
+                        fd,
+                        int(response["arena_size"]),
+                        torch.accelerator.current_device_index(),
+                    )
+                finally:
+                    os.close(fd)
         status = response.get("status")
         if status == "mismatch":
             raise CacheConfigMismatchError(
@@ -471,11 +500,17 @@ class IpcModelLoader(BaseModelLoader):
             raise WeightCacheUnavailableError(
                 f"Weight cache daemon error: {response.get('message')}"
             )
-        self._check_gpu_uuid(response.get("gpu_uuid"))
+        try:
+            self._check_gpu_uuid(response.get("gpu_uuid"))
+        except BaseException:
+            if allocation is not None:
+                allocation.close()
+            raise
         return WeightCacheState(
             entries=response["entries"],
             aliases=response.get("aliases", {}),
             attrs=response.get("attrs", {}),
+            allocation=allocation,
         )
 
     def _connect(self, timeout: float) -> socket.socket:

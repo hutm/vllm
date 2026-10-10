@@ -318,6 +318,7 @@ def packed_ipc_producer(
     gpu_uuid: str,
     post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+    vmm_fd: bool = False,
 ) -> Iterator[PackedIpcChunk]:
     """Pack tensors into a reusable IPC buffer and yield handles.
 
@@ -337,11 +338,45 @@ def packed_ipc_producer(
         buffer_size_bytes: Exact capacity of the reusable IPC buffer.
             Every chunk is guaranteed to fit within this size.  A
             ``ValueError`` is raised if any single tensor exceeds it.
+        vmm_fd: Share the buffer as a CUDA VMM allocation whose fd workers
+            fetch from a private Unix socket, instead of ``reduce_tensor``
+            (see ``vmm_fd_buffer``).
 
     """
-    ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device="cuda")
-    _, ipc_args = reduce_tensor(ipc_buffer)
+    if not vmm_fd:
+        ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device="cuda")
+        _, ipc_args = reduce_tensor(ipc_buffer)
+        yield from _packed_ipc_chunks(
+            iterator, gpu_uuid, post_iter_func, buffer_size_bytes, ipc_buffer, ipc_args
+        )
+        return
 
+    from vllm.distributed.weight_transfer.vmm_fd_buffer import SharedPackedBuffer
+
+    shared = SharedPackedBuffer(
+        buffer_size_bytes, torch.accelerator.current_device_index()
+    )
+    try:
+        yield from _packed_ipc_chunks(
+            iterator,
+            gpu_uuid,
+            post_iter_func,
+            buffer_size_bytes,
+            shared.allocation.tensor(0, buffer_size_bytes),
+            shared.handle(),
+        )
+    finally:
+        shared.close()
+
+
+def _packed_ipc_chunks(
+    iterator: Iterator[tuple[str, torch.Tensor]],
+    gpu_uuid: str,
+    post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
+    buffer_size_bytes: int,
+    ipc_buffer: torch.Tensor,
+    ipc_args: tuple,
+) -> Iterator[PackedIpcChunk]:
     names: list[str] = []
     shapes: list[list[int]] = []
     dtypes: list[torch.dtype] = []
@@ -416,20 +451,37 @@ class PackedBufferImporter:
 
     def __init__(self) -> None:
         self._entry: tuple[tuple, torch.Tensor] | None = None
+        self._allocation: Any = None  # vmm_fd mapping behind self._entry
 
-    def rebuild(self, list_args: list) -> torch.Tensor:
+    def rebuild(self, list_args: list, device_index: int | None = None) -> torch.Tensor:
         from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        from vllm.distributed.weight_transfer.vmm_fd_buffer import (
+            import_shared_buffer,
+            is_vmm_fd_handle,
+        )
 
         key = tuple(list_args)
         if self._entry is not None and self._entry[0] == key:
             return self._entry[1]
-        packed = rebuild_cuda_tensor(*list_args)
+        self.close()
+        if is_vmm_fd_handle(list_args):
+            if device_index is None:
+                device_index = torch.accelerator.current_device_index()
+            self._allocation = import_shared_buffer(list_args, device_index)
+            packed = self._allocation.tensor(0, self._allocation.size)
+        else:
+            packed = rebuild_cuda_tensor(*list_args)
         self._entry = (key, packed)
         return packed
 
     def close(self) -> None:
-        """Release the held mapping (one producer-side refcount decrement)."""
+        """Release the held mapping (one producer-side refcount decrement, or
+        this process's reference to a vmm_fd buffer)."""
         self._entry = None
+        if self._allocation is not None:
+            self._allocation.close()
+            self._allocation = None
 
 
 def packed_ipc_consumer(
@@ -477,18 +529,27 @@ def packed_ipc_consumer(
             f"Available UUIDs: {list(ipc_handle.keys())}"
         )
 
+    from vllm.distributed.weight_transfer.vmm_fd_buffer import is_vmm_fd_handle
+
     args = ipc_handle[physical_gpu_id]
     list_args = list(args)
-    list_args[6] = device_index
+    if not is_vmm_fd_handle(list_args):
+        # Index 6 of the reduce_tensor args is the device index.
+        list_args[6] = device_index
+    ephemeral = importer is None
     if importer is None:
         importer = PackedBufferImporter()
-    packed = importer.rebuild(list_args)
+    packed = importer.rebuild(list_args, device_index)
 
     content_size = sum(tensor_sizes)
     packed = packed[:content_size]
 
     dtypes = [getattr(torch, dn) for dn in dtype_names]
-    return [
+    weights = [
         (name, t.clone())
         for name, t in unpack_tensor(packed, names, shapes, dtypes, tensor_sizes)
     ]
+    if ephemeral:
+        torch.accelerator.synchronize()
+        importer.close()
+    return weights

@@ -334,3 +334,27 @@ def test_cumem_allocator_requirement_follows_the_backend():
 
 def test_default_backend_allocation_context_is_unset():
     assert CuMemBackend().allocation_context("kv_cache") is None
+
+
+def test_offload_kv_backend_offloads_kv_cache_only_at_level_one():
+    from vllm.device_allocator.sleep_mode_backend import CuMemOffloadKVBackend
+
+    assert (
+        SleepModeBackendFactory.get_backend_class("cumem_offload_kv")
+        is CuMemOffloadKVBackend
+    )
+    backend = CuMemOffloadKVBackend()
+    assert "kv_cache" in backend.offload_tags(1)
+    assert "weights" in backend.offload_tags(1)
+    assert "kv_cache" not in backend.offload_tags(2)
+    assert backend.offload_tags(2) == CuMemBackend().offload_tags(2)
+    assert CuMemOffloadKVBackend.preserves_kv_cache(1) is True
+    assert CuMemOffloadKVBackend.preserves_kv_cache(2) is False
+    assert "kv_cache" not in CuMemBackend().offload_tags(1)
+
+
+def test_offload_kv_backend_keeps_prefix_cache_only_at_level_one():
+    assert _sleep_decision("cumem_offload_kv", 1, None) is False
+    assert _sleep_decision("cumem_offload_kv", 2, None) is True
+    with pytest.raises(ValueError, match="preserves KV cache contents"):
+        _sleep_decision("cumem_offload_kv", 2, False)

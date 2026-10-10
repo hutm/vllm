@@ -819,6 +819,62 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
+    def import_cached_blocks(
+        self,
+        block_hashes: Sequence[BlockHashWithGroupId],
+        block_ids: Sequence[int],
+        num_tokens: Sequence[int | None] | None = None,
+    ) -> list[int]:
+        """Register free blocks that already hold valid KV as cache entries.
+
+        For KV produced outside the scheduler: memory that outlived a previous
+        engine process, a restored snapshot, or a transfer that wrote straight
+        into these blocks. Block ``block_ids[i]`` becomes reachable under
+        ``block_hashes[i]`` through ``get_cached_block`` and is placed at the
+        most-recently-used end of the free queue, like a block whose request
+        just finished.
+
+        A block is skipped if it is the null block, is in use
+        (``ref_cnt > 0``), or if its hash is already cached by another block.
+        A free block that holds other cache entries is evicted first.
+        ``num_tokens[i]`` is the token length the hash covers (as
+        ``block_hash_num_tokens``), if known.
+
+        Lifecycle hooks other than ``on_cached_block_evicted`` are not called,
+        and no KV cache events are emitted: the caller owns the external state
+        it imports from.
+
+        Returns:
+            The ids of the blocks that were imported.
+
+        """
+        if len(block_hashes) != len(block_ids):
+            raise ValueError("block_hashes and block_ids must have the same length")
+        if num_tokens is not None and len(num_tokens) != len(block_ids):
+            raise ValueError("num_tokens must match block_ids in length")
+        if not self.enable_caching:
+            return []
+
+        imported: list[KVCacheBlock] = []
+        for i, (block_hash, block_id) in enumerate(zip(block_hashes, block_ids)):
+            if not 0 <= block_id < self.num_gpu_blocks:
+                raise ValueError(f"Invalid block_id {block_id}")
+            block = self.blocks[block_id]
+            if block.is_null or block.ref_cnt != 0:
+                continue
+            if self.cached_block_hash_to_block.get_one_block(block_hash) is not None:
+                continue
+            self._maybe_evict_cached_block(block)
+            self._insert_block_hash(
+                block_hash,
+                block,
+                num_tokens=None if num_tokens is None else num_tokens[i],
+            )
+            self.free_block_queue.remove(block)
+            imported.append(block)
+        self.free_block_queue.append_n(imported)
+        return [block.block_id for block in imported]
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 

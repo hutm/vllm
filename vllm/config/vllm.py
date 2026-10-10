@@ -700,7 +700,7 @@ class VllmConfig:
             model_config is not None
             and model_config.sleep_mode_offload_cudagraph
             and model_config.enable_sleep_mode
-            and model_config.sleep_mode_backend == "cumem"
+            and model_config.sleep_mode_backend in ("cumem", "cumem_offload_kv")
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and current_platform.is_cuda()
         )

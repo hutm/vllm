@@ -74,6 +74,12 @@ key, Unix sockets (``*_draft.sock``) and rendezvous port
 (``--weight-cache-draft-master-port``, default ``--weight-cache-master-port +
 1``), so each process serves exactly one model role. Other draft types are not
 cached and keep loading from disk in the engine.
+
+``--weight-cache-transport`` picks how engines map the cached weights:
+``cuda_ipc`` (default) exports PyTorch CUDA IPC handles; ``vmm_fd`` packs the
+weights into one shareable CUDA VMM allocation and passes it as a file
+descriptor over the socket, so each engine holds its own reference to the
+memory.
 """
 
 import contextlib
@@ -92,6 +98,7 @@ from vllm.config import (
     replace,
     set_current_vllm_config,
 )
+from vllm.device_allocator.cuda_vmm import send_fd
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -116,6 +123,12 @@ from vllm.model_executor.model_loader.weight_cache.utils import (
     format_daemon_role,
     is_draft_model_cacheable,
 )
+from vllm.model_executor.model_loader.weight_cache.vmm import (
+    CUDA_IPC,
+    VMM_FD,
+    WEIGHT_CACHE_TRANSPORTS,
+    WeightArena,
+)
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -126,6 +139,7 @@ logger = init_logger("vllm.model_executor.model_loader.weight_cache.daemon")
 
 def export_entries(
     model: torch.nn.Module,
+    arena: WeightArena | None = None,
 ) -> tuple[dict[str, TensorEntry], dict[str, str]]:
     """Export a model's tensors, preserving tied-parameter aliases.
 
@@ -138,7 +152,9 @@ def export_entries(
     memory for it.
 
     CUDA reduction arguments must be exported separately for each consumer so
-    that PyTorch registers a reference for each IPC mapping's lifetime.
+    that PyTorch registers a reference for each IPC mapping's lifetime. With
+    ``arena`` (the ``vmm_fd`` transport) CUDA tensors are exported as
+    references into the shared allocation instead.
 
     Returns:
         A ``(entries, aliases)`` pair where ``entries`` maps a canonical name to
@@ -156,7 +172,7 @@ def export_entries(
             aliases[name] = canonical
             return
         canonical_by_id[id(tensor)] = name
-        entries[name] = TensorEntry.from_tensor(tensor, kind)
+        entries[name] = TensorEntry.from_tensor(tensor, kind, arena)
 
     for name, param in model.named_parameters(remove_duplicate=False):
         _add(name, param, "param")
@@ -182,7 +198,15 @@ class WeightCacheDaemon:
         is_draft: bool = False,
         dp_rank: int = 0,
         pp_rank: int = 0,
+        transport: str = CUDA_IPC,
     ):
+        if transport not in WEIGHT_CACHE_TRANSPORTS:
+            raise ValueError(
+                f"Unknown weight cache transport {transport!r}; expected one of "
+                f"{WEIGHT_CACHE_TRANSPORTS}"
+            )
+        self.transport = transport
+        self.arena: WeightArena | None = None
         parallel_config = vllm_config.parallel_config
         self.tp_size = parallel_config.tensor_parallel_size
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -251,6 +275,9 @@ class WeightCacheDaemon:
         with set_current_vllm_config(self.vllm_config):
             ensure_model_parallel_initialized(self.tp_size, self.pp_size)
             self.model = self.get_model()
+        if self.transport == VMM_FD:
+            # The originals are freed once nothing references them.
+            self.arena = WeightArena.pack(self.model, self.local_rank)
         # Loading and post-processing leave freed transients in the caching
         # allocator; return them so engines sharing the GPU can use them.
         gc.collect()
@@ -405,17 +432,25 @@ class WeightCacheDaemon:
             send_msg(conn, {"status": "error", "message": "Weights were released"})
             return
         gpu_uuid = get_current_device_uuid()
-        entries, aliases = export_entries(self.model)
-        send_msg(
-            conn,
-            {
-                "status": "ok",
-                "entries": entries,
-                "aliases": aliases,
-                "attrs": export_model_attrs(self.model),
-                "gpu_uuid": gpu_uuid,
-            },
-        )
+        entries, aliases = export_entries(self.model, self.arena)
+        response = {
+            "status": "ok",
+            "entries": entries,
+            "aliases": aliases,
+            "attrs": export_model_attrs(self.model),
+            "gpu_uuid": gpu_uuid,
+            "transport": self.transport,
+        }
+        if self.arena is None:
+            send_msg(conn, response)
+        else:
+            response["arena_size"] = self.arena.size
+            fd = self.arena.export_fd()
+            try:
+                send_msg(conn, response)
+                send_fd(conn, fd)
+            finally:
+                os.close(fd)
         logger.info_once(
             "Weight cache %s daemon rank %d sent %d tensors (+%d aliases) to engine",
             self.role,
@@ -426,6 +461,10 @@ class WeightCacheDaemon:
 
     def _handle_release(self, conn: socket.socket) -> None:
         self.model = None
+        if self.arena is not None:
+            # Engines that imported the arena keep their own reference.
+            self.arena.close()
+            self.arena = None
         torch.accelerator.empty_cache()
         logger.info(
             "Weight cache %s daemon rank %d released cached weights",
@@ -445,6 +484,7 @@ def _run_daemon(
     is_draft: bool = False,
     dp_rank: int = 0,
     pp_rank: int = 0,
+    transport: str = CUDA_IPC,
 ) -> None:
     daemon = WeightCacheDaemon(
         vllm_config,
@@ -455,6 +495,7 @@ def _run_daemon(
         is_draft,
         dp_rank,
         pp_rank,
+        transport,
     )
     daemon.load_model()
     daemon.serve_forever(

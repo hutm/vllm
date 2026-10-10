@@ -20,7 +20,7 @@ import stat
 import struct
 import tempfile
 from dataclasses import dataclass, fields
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
@@ -37,6 +37,13 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.hashing import safe_hash
+
+if TYPE_CHECKING:
+    from vllm.device_allocator.cuda_vmm import ShareableAllocation
+    from vllm.model_executor.model_loader.weight_cache.vmm import (
+        VmmTensorRef,
+        WeightArena,
+    )
 
 SOCKET_NAME_TEMPLATE = "vllm_weight_cache_{gpu_uuid}{role}.sock"
 SOCKET_DIR_TEMPLATE = "vllm_weight_cache_{uid}"
@@ -354,23 +361,35 @@ class TensorEntry:
     """A single cached tensor.
 
     CUDA tensors are exported as `torch.multiprocessing` reduction args
-    (CUDA IPC handles); non-CUDA tensors are shipped by value.
+    (CUDA IPC handles) or, with the ``vmm_fd`` transport, as a reference into
+    the daemon's shared allocation; non-CUDA tensors are shipped by value.
     """
 
     kind: str
     """Either "param" or "buffer"."""
     ipc_args: tuple | None = None
     cpu_tensor: torch.Tensor | None = None
+    vmm: "VmmTensorRef | None" = None
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor, kind: str) -> "TensorEntry":
+    def from_tensor(
+        cls, tensor: torch.Tensor, kind: str, arena: "WeightArena | None" = None
+    ) -> "TensorEntry":
         tensor = tensor.detach()
         if tensor.is_cuda:
+            if arena is not None:
+                return cls(kind=kind, vmm=arena.ref(tensor))
             _, ipc_args = reduce_tensor(tensor)
             return cls(kind=kind, ipc_args=ipc_args)
         return cls(kind=kind, cpu_tensor=tensor.cpu())
 
-    def rebuild(self, device_index: int) -> torch.Tensor:
+    def rebuild(
+        self, device_index: int, allocation: "ShareableAllocation | None" = None
+    ) -> torch.Tensor:
+        if self.vmm is not None:
+            if allocation is None:
+                raise RuntimeError("vmm_fd entry without a mapped weight arena")
+            return self.vmm.rebuild(allocation)
         if self.ipc_args is None:
             assert self.cpu_tensor is not None
             return self.cpu_tensor
@@ -391,6 +410,8 @@ class WeightCacheState(NamedTuple):
     """Duplicate (tied) weight names aliased to their canonical entry."""
     attrs: dict[str, bool]
     """Python-side flags set by load_weights, e.g. EAGLE ownership flags."""
+    allocation: "ShareableAllocation | None" = None
+    """The mapped weight arena for ``vmm_fd`` entries."""
 
 
 def send_msg(sock: socket.socket, obj: Any) -> None:

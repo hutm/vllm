@@ -478,3 +478,33 @@ def test_cudagraph_pool_sleep(level):
     weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
     held[0].replay()
     assert torch.equal(held[1], torch.full_like(x, 5.0))
+
+
+@pytest.mark.parametrize("backend", ["cumem", "cumem_offload_kv"])
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+def test_prefix_cache_across_level1_sleep(backend):
+    """cumem_offload_kv restores the KV cache, so prefixes stay cached."""
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        enable_sleep_mode=True,
+        sleep_mode_backend=backend,
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        max_model_len=1024,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.05,
+    )
+    prompt = "The quick brown fox jumps over the lazy dog. " * 16
+    sampling_params = SamplingParams(temperature=0, max_tokens=16)
+    expected = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids
+
+    llm.sleep(level=1)
+    llm.wake_up()
+    output = llm.generate(prompt, sampling_params)[0]
+
+    assert output.outputs[0].token_ids == expected
+    if backend == "cumem_offload_kv":
+        assert output.num_cached_tokens > 0
+    else:
+        assert output.num_cached_tokens == 0

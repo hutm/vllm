@@ -376,8 +376,10 @@ class ModelConfig:
     sleep_mode_backend: str = "cumem"
     """Mechanism used to free and restore GPU state for sleep mode. ``"cumem"``
     (default) uses the built-in ``CuMemAllocator`` and is behavior-compatible
-    with prior releases. Additional backends (CUDA checkpoint, CRIU, durable
-    snapshot) may be registered in-tree or by plugins (RFC #34303)."""
+    with prior releases. ``"cumem_offload_kv"`` also offloads the KV cache at
+    level 1, so the prefix cache survives sleep. Additional backends (CUDA
+    checkpoint, CRIU, durable snapshot) may be registered in-tree or by plugins
+    (RFC #34303)."""
     sleep_mode_offload_cudagraph: bool = False
     """Back up CUDA graph memory to CPU during sleep, restored in place on wake.
     Takes effect with enable_sleep_mode, the cumem backend and CUDA graphs."""

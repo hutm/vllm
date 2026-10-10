@@ -361,7 +361,16 @@ class Worker(WorkerBase):
     def reset_weights(self) -> None:
         zero_weights(self.model_runner.get_model())
 
-    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+    def _maybe_get_memory_pool_context(
+        self, tag: str, kv_cache_config: KVCacheConfig | None = None
+    ) -> AbstractContextManager:
+        if self.vllm_config.model_config.enable_sleep_mode:
+            backend_context = self.sleep_mode_backend.allocation_context(
+                tag, kv_cache_config=kv_cache_config
+            )
+            if backend_context is not None:
+                return backend_context
+
         if (
             current_platform.is_cuda_alike()
             and not self.vllm_config.model_config.enable_cumem_allocator
@@ -847,7 +856,9 @@ class Worker(WorkerBase):
             else None
         )
         if mem_pool_context is None:
-            mem_pool_context = self._maybe_get_memory_pool_context(tag="kv_cache")
+            mem_pool_context = self._maybe_get_memory_pool_context(
+                tag="kv_cache", kv_cache_config=kv_cache_config
+            )
 
         # Offload KV-init state, except on XPU, whose outermost pool would win.
         runtime_pool = (

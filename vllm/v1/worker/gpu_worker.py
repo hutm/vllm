@@ -968,6 +968,18 @@ class Worker(WorkerBase):
             raise RuntimeError("KV restore: this worker has no standby KV pool")
         client.promote(timeout_s)
 
+    def kv_restore_warmup(self, token_counts: list[int]) -> int:
+        """Compile and launch the forward path at these batch sizes without
+        touching the KV cache, so a standby that maps the writer's pool is
+        warm when promoted. Dummy runs pad every slot mapping, so they never
+        write a KV block. Returns the number of sizes run."""
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        sizes = sorted({min(max(1, n), max_tokens) for n in token_counts})
+        for num_tokens in sizes:
+            self.model_runner._dummy_run(num_tokens)
+        torch.accelerator.synchronize()
+        return len(sizes)
+
     def _kv_restore_backing(self, kv_cache_config: KVCacheConfig):
         if self.vllm_config.model_config.enable_sleep_mode:
             raise ValueError("KV restore cannot be combined with sleep mode")

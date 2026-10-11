@@ -68,6 +68,8 @@ from vllm.model_executor.model_loader.weight_cache.kv_restore import (
     KVRestoreClient,
     kv_layout_key,
     kv_restore_enabled,
+    kv_restore_role,
+    kv_restore_wait_s,
 )
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -551,11 +553,18 @@ class Worker(WorkerBase):
             # either re-attached as this engine's KV cache or freed before the
             # engine allocates its own.
             pool = self.kv_restore_probe()
+            # A standby maps the writer's pool instead of allocating its own.
+            standby = (
+                kv_restore_enabled(self.vllm_config)
+                and kv_restore_role(self.vllm_config) == "standby"
+            )
             self.requested_memory = request_memory(
                 init_snapshot,
                 self.cache_config,
                 external_weight_memory,
-                reclaimable_memory=pool["size"] if pool and not pool["busy"] else 0,
+                reclaimable_memory=(
+                    pool["size"] if pool and (standby or not pool["busy"]) else 0
+                ),
             )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -934,7 +943,11 @@ class Worker(WorkerBase):
         client = getattr(self, "_kv_restore", None)
         if client is None:
             loader = IpcModelLoader(self.load_config)
-            client = self._kv_restore = KVRestoreClient(loader._resolve_socket_path())
+            client = self._kv_restore = KVRestoreClient(
+                loader._resolve_socket_path(),
+                role=kv_restore_role(self.vllm_config),
+                standby_wait_s=kv_restore_wait_s(self.vllm_config),
+            )
         return client
 
     def kv_restore_probe(self) -> dict | None:
@@ -948,6 +961,13 @@ class Worker(WorkerBase):
         client = getattr(self, "_kv_restore", None)
         return None if client is None else client.status()
 
+    def kv_restore_promote(self, timeout_s: float) -> None:
+        """Take over this GPU's KV pool from the (gone) writer."""
+        client = getattr(self, "_kv_restore", None)
+        if client is None or client.allocation is None:
+            raise RuntimeError("KV restore: this worker has no standby KV pool")
+        client.promote(timeout_s)
+
     def _kv_restore_backing(self, kv_cache_config: KVCacheConfig):
         if self.vllm_config.model_config.enable_sleep_mode:
             raise ValueError("KV restore cannot be combined with sleep mode")
@@ -955,7 +975,10 @@ class Worker(WorkerBase):
 
         def provider(nbytes: int, device: torch.device) -> torch.Tensor | None:
             key = kv_layout_key(kv_cache_config, nbytes, self.vllm_config)
-            return client.attach(key, nbytes, kv_cache_config.num_blocks, device)
+            buf = client.attach(key, nbytes, kv_cache_config.num_blocks, device)
+            if buf is None and client.role == "standby":
+                raise RuntimeError("KV restore standby: the daemon is unreachable")
+            return buf
 
         return provide_kv_cache_backing(provider)
 

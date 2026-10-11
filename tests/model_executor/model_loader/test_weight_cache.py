@@ -9,6 +9,7 @@ identical outputs.
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -23,6 +24,7 @@ from typing import Any
 
 import pytest
 import regex as re
+import torch
 
 from vllm import SamplingParams
 from vllm.assets.image import ImageAsset
@@ -427,6 +429,133 @@ def test_kv_restore_survives_engine_crash():
     # Engine B's very first request hits the prefix cache engine A built.
     assert restored[0]["cached_tokens"] > 0.9 * restored[0]["prompt_tokens"] - 16
     assert [r["text"] for r in restored] == [r["text"] for r in cold]
+    assert [r["text"] for r in warm_a] == [r["text"] for r in cold]
+
+
+_KV_STANDBY_ENGINE = """
+import json, sys, time
+from vllm import LLM, SamplingParams
+cfg = json.loads(sys.argv[1])
+llm = LLM(
+    model=cfg["model"],
+    load_format="ipc_cache",
+    model_loader_extra_config={
+        "socket_dir": cfg["socket_dir"],
+        "fallback": False,
+        "kv_restore": True,
+        "kv_restore_role": "standby",
+    },
+    gpu_memory_utilization=0.3,
+    enforce_eager=True,
+    max_num_seqs=1,
+    enable_prefix_caching=True,
+)
+print("KV_STANDBY_READY", flush=True)
+assert sys.stdin.readline().strip() == "promote"
+start = time.perf_counter()
+adopted = llm.llm_engine.engine_core.call_utility("kv_restore_promote", 60.0, 2.0)
+promote_s = time.perf_counter() - start
+sp = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+results = []
+for prompt in cfg["prompts"]:
+    out = llm.generate([prompt], sp, use_tqdm=False)[0]
+    results.append(
+        {
+            "text": out.outputs[0].text,
+            "cached_tokens": out.num_cached_tokens,
+            "prompt_tokens": len(out.prompt_token_ids),
+        }
+    )
+print(
+    "KV_RESTORE_RESULT "
+    + json.dumps({"adopted": adopted, "promote_s": promote_s, "results": results}),
+    flush=True,
+)
+"""
+
+
+def _gpu_used_bytes() -> int:
+    free, total = torch.cuda.mem_get_info(0)
+    return total - free
+
+
+def test_kv_restore_standby_takes_over_from_a_frozen_writer():
+    """A standby engine maps the writer's KV pool and the daemon's weights
+    (no second copy). The writer is frozen (SIGSTOP: alive, still connected,
+    like ranks stuck in a collective with a dead one); the standby is promoted
+    without waiting for it and serves the writer's prompts from the inherited
+    prefix cache, with identical greedy outputs."""
+    if not current_platform.is_cuda():
+        pytest.skip("KV restore needs CUDA VMM")
+    model = "Qwen/Qwen3-0.6B"
+    prefix = " ".join(
+        f"Fact {i}: the standby engine takes over the writer's KV cache."
+        for i in range(120)
+    )
+    prompts = [
+        prefix + " Question: who takes over?",
+        prefix + " Question: what is inherited?",
+    ]
+    with WeightCacheDaemon(model, tp_size=1) as d:
+        cfg = {"model": model, "socket_dir": d.socket_dir, "prompts": prompts}
+        cold, _, _ = _run_kv_restore_engine({**cfg, "kv_restore": False})
+
+        warm_a, engine_a, _ = _run_kv_restore_engine(
+            {**cfg, "kv_restore": True}, hold=True
+        )
+        used_before_b = _gpu_used_bytes()
+        engine_b = subprocess.Popen(
+            [sys.executable, "-c", _KV_STANDBY_ENGINE, json.dumps(cfg)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        assert engine_b.stdout is not None and engine_b.stdin is not None
+        log_b = []
+        for line in engine_b.stdout:
+            log_b.append(line)
+            if line.startswith("KV_STANDBY_READY"):
+                break
+        else:
+            raise AssertionError("standby exited:\n" + "".join(log_b[-60:]))
+        standby_added = _gpu_used_bytes() - used_before_b
+
+        os.killpg(engine_a.pid, signal.SIGSTOP)
+        engine_b.stdin.write("promote\n")
+        engine_b.stdin.flush()
+        result = None
+        for line in engine_b.stdout:
+            log_b.append(line)
+            if line.startswith("KV_RESTORE_RESULT "):
+                result = json.loads(line.split(" ", 1)[1])
+                break
+        engine_b.stdin.close()
+        engine_b.wait(timeout=120)
+        os.killpg(engine_a.pid, signal.SIGKILL)
+        engine_a.wait(timeout=60)
+        assert result is not None, "".join(log_b[-60:])
+
+    pool_bytes = next(
+        float(m.group(1))
+        for line in log_b
+        if (
+            m := re.search(r"standby mapped the writer's KV cache \(([\d.]+) GiB", line)
+        )
+    ) * (1 << 30)
+    print(
+        f"standby added {standby_added / (1 << 30):.2f} GiB next to a "
+        f"{pool_bytes / (1 << 30):.2f} GiB KV pool; promote took "
+        f"{result['promote_s']:.3f}s, adopted {result['adopted']} blocks;",
+        result["results"],
+    )
+    # The standby did not allocate a second KV cache.
+    assert standby_added < pool_bytes / 2
+    assert result["adopted"] > 0
+    first = result["results"][0]
+    assert first["cached_tokens"] > 0.9 * first["prompt_tokens"] - 16
+    assert [r["text"] for r in result["results"]] == [r["text"] for r in cold]
     assert [r["text"] for r in warm_a] == [r["text"] for r in cold]
 
 

@@ -38,6 +38,7 @@ from vllm.model_executor.model_loader.weight_cache.kv_restore import (
     KV_RESTORE_BLOCK_POOL,
     KVRestoreBlockPool,
     kv_restore_enabled,
+    kv_restore_role,
 )
 from vllm.multimodal.cache import (
     MultiModalCacheMissError,
@@ -434,7 +435,9 @@ class EngineCore:
         if cache_config.num_gpu_blocks_override is not None:
             return
         pools = self.collective_rpc("kv_restore_probe")
-        if not pools or any(p is None or p["busy"] for p in pools):
+        # A standby always sizes to the writer's (busy) pool.
+        standby = kv_restore_role(vllm_config) == "standby"
+        if not pools or any(p is None or (p["busy"] and not standby) for p in pools):
             return
         num_blocks = {p["num_blocks"] for p in pools}
         if len(num_blocks) == 1:
@@ -444,20 +447,70 @@ class EngineCore:
                 cache_config.num_gpu_blocks_override,
             )
 
-    def _start_kv_restore(self) -> None:
+    def _kv_restore_block_pool(self) -> KVRestoreBlockPool | None:
         block_pool = getattr(
             getattr(self.scheduler, "kv_cache_manager", None), "block_pool", None
         )
-        if not isinstance(block_pool, KVRestoreBlockPool):
-            return
+        return block_pool if isinstance(block_pool, KVRestoreBlockPool) else None
+
+    def _start_kv_restore(
+        self,
+        timeout_s: float = 60.0,
+        quarantine_grace_s: float = 2.0,
+        revoke: bool = False,
+    ) -> int:
+        block_pool = self._kv_restore_block_pool()
+        if block_pool is None:
+            return 0
+        if kv_restore_role(self.vllm_config) == "standby" and not getattr(
+            self, "_kv_restore_promoted", False
+        ):
+            # Idle until promoted: no directory session, nothing imported.
+            return 0
         statuses = self.collective_rpc("kv_restore_status")
         if not statuses or statuses[0] is None:
-            return
-        block_pool.start_kv_restore(
+            return 0
+        return block_pool.start_kv_restore(
             statuses[0]["socket_path"],
             [s["generation"] if s else None for s in statuses],
             restored=all(s and s["restored"] for s in statuses),
+            timeout_s=timeout_s,
+            quarantine_grace_s=quarantine_grace_s,
+            revoke=revoke,
         )
+
+    def kv_restore_promote(
+        self, timeout_s: float, quarantine_grace_s: float = 2.0
+    ) -> int:
+        """Promote a KV restore standby to writer now. The old writer is
+        revoked, not waited for: it may still be alive (e.g. frozen in a
+        collective with a dead rank). Every worker takes over its GPU's pool,
+        the committed prefix directory is adopted, and blocks the old writer
+        may still write (allocated but uncommitted, or evicted later) are
+        quarantined until its daemon session closes plus
+        ``quarantine_grace_s``, or ``kv_restore_release_quarantine``.
+        ``timeout_s`` bounds the daemon round trips. Returns the number of
+        adopted blocks; idempotent."""
+        if getattr(self, "_kv_restore_promoted", False):
+            return getattr(self, "_kv_restore_adopted", 0)
+        if kv_restore_role(self.vllm_config) != "standby":
+            raise RuntimeError("kv_restore_promote: this engine is not a standby")
+        self.collective_rpc("kv_restore_promote", args=(timeout_s,))
+        self._kv_restore_promoted = True
+        self._kv_restore_adopted = self._start_kv_restore(
+            timeout_s=timeout_s, quarantine_grace_s=quarantine_grace_s, revoke=True
+        )
+        logger.info(
+            "KV restore: promoted to writer, adopted %d cached blocks",
+            self._kv_restore_adopted,
+        )
+        return self._kv_restore_adopted
+
+    def kv_restore_release_quarantine(self) -> int:
+        """Release the previous writer's quarantined blocks now (e.g. the
+        orchestrator proved its GPU work stopped). Returns their number."""
+        block_pool = self._kv_restore_block_pool()
+        return 0 if block_pool is None else block_pool.release_quarantine()
 
     def _initialize_effective_attention_block_size(self) -> None:
         cache_config = self.vllm_config.cache_config

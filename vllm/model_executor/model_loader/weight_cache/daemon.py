@@ -448,17 +448,16 @@ class WeightCacheDaemon:
     def _handle_connection(self, conn: socket.socket) -> None:
         request = recv_msg(conn)
         cmd = request.get("cmd")
-        if cmd in ("kv_attach", "kv_directory"):
-            # Persistent KV session: the open connection is the lease, so it
-            # runs on its own thread with its own copy of the socket.
+        if cmd in ("kv_attach", "kv_directory", "kv_probe"):
+            # Persistent or waiting KV requests (the open connection is the
+            # lease; a standby waits for the writer's pool) run on their own
+            # thread with their own copy of the socket.
             threading.Thread(
                 target=serve_kv_session,
                 args=(self.kv_store, conn.dup(), request),
                 name=f"vllm-kv-session-{cmd}",
                 daemon=True,
             ).start()
-        elif cmd == "kv_probe":
-            send_msg(conn, {"status": "ok", "pool": self.kv_store.probe()})
         elif cmd == "get_state":
             self._handle_get_state(conn, request)
         elif cmd == "get_memory":

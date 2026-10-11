@@ -89,6 +89,10 @@ class IpcModelLoader(BaseModelLoader):
     - kv_restore: keep the KV cache, and the prefix cache, in memory held by
       the daemon so a restarted engine picks it up (default: False). See
       ``kv_restore.py``.
+    - kv_restore_role: "writer" (default) or "standby": map the writer's KV
+      pool next to it and wait for the ``kv_restore_promote`` utility.
+    - kv_restore_wait_s: how long a standby waits at startup for the writer's
+      KV pool (default: 1800).
 
     Note: in zero-copy mode the weights live in the daemon's CUDA IPC
     allocations (or, with the daemon's ``vmm_fd`` transport, in its shared
@@ -113,6 +117,8 @@ class IpcModelLoader(BaseModelLoader):
         self.mode: str = extra_config.pop("mode", "zero_copy")
         # Consumed by the worker and engine core (see kv_restore.py).
         self.kv_restore: bool = bool(extra_config.pop("kv_restore", False))
+        self.kv_restore_role: str = extra_config.pop("kv_restore_role", "writer")
+        self.kv_restore_wait_s = extra_config.pop("kv_restore_wait_s", None)
         self.fallback: bool = extra_config.pop("fallback", True)
         self.connect_timeout_s: float = float(
             extra_config.pop("connect_timeout_s", _CONNECT_TIMEOUT_S)

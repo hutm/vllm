@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -28,6 +28,9 @@ from vllm.v1.core.kv_cache_utils import (
     to_event_extra_keys,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -970,6 +973,17 @@ class BlockPool:
     ) -> None:
         """Called after ``cache_full_blocks`` adds ``blocks`` (full blocks of
         group ``kv_cache_group_id``) to the prefix cache."""
+
+    def on_step_scheduled(self, scheduler_output: "SchedulerOutput") -> None:
+        """Called at the end of ``Scheduler.schedule`` with the step it just
+        built. Blocks cached since the previous call belong to this step: their
+        KV is written by it (or was written before it)."""
+
+    def on_step_output_processed(self, scheduler_output: "SchedulerOutput") -> None:
+        """Called when ``Scheduler.update_from_output`` starts processing the
+        output of ``scheduler_output``. Every GPU write enqueued by that step
+        and earlier steps has completed, so the KV of blocks cached before the
+        matching ``on_step_scheduled`` is complete."""
 
     def on_scheduler_paused(self) -> None:
         """Called when a pause (``pause_scheduler`` or ``sleep``) completes:

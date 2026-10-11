@@ -139,3 +139,75 @@ def test_completed_pause_notifies_the_block_pool():
     )
     core._finish_pause(clear_cache=False)
     assert calls == ["paused"]
+
+
+def test_scheduler_brackets_each_step_for_the_block_pool():
+    """Blocks cached while a step is scheduled are only written once that
+    step's output is processed; the pool sees both ends of each step, in
+    order, with the same SchedulerOutput."""
+    from tests.v1.core.utils import create_requests, create_scheduler
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    pool = scheduler.kv_cache_manager.block_pool
+    events = []
+    pool.on_step_scheduled = lambda out: events.append(("scheduled", out))
+    pool.on_step_output_processed = lambda out: events.append(("processed", out))
+
+    (request,) = create_requests(num_requests=1, num_tokens=40)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert events == [("scheduled", output)]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert events == [("scheduled", output), ("processed", output)]
+
+
+def test_kv_cache_backing_provider_supplies_the_buffer():
+    """allocate_kv_cache views the provider's buffer as-is: same memory, and
+    its contents are not zero-filled."""
+    import torch
+
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.utils import allocate_kv_cache, provide_kv_cache_backing
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    num_blocks, page = 4, spec.page_size_bytes
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * page,
+                layers=["l0"],
+                layer_stride=num_blocks * page,
+                block_stride=page,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["l0"], spec)],
+    )
+    backing = torch.full((num_blocks * page,), 7, dtype=torch.int8)
+    with provide_kv_cache_backing(lambda nbytes, device: backing):
+        caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    cache = caches["l0"]
+    assert cache.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert torch.all(cache.view(torch.int8) == 7)
+    # Without a provider the buffer is freshly zeroed.
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    assert not torch.any(caches["l0"].view(torch.int8))

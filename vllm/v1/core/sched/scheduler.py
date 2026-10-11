@@ -1554,6 +1554,7 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self.kv_cache_manager.block_pool.on_step_scheduled(scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2047,6 +2048,7 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+        self.kv_cache_manager.block_pool.on_step_output_processed(scheduler_output)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

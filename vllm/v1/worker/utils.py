@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
@@ -43,6 +45,28 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+_KV_CACHE_BACKING: ContextVar[
+    Callable[[int, torch.device], torch.Tensor | None] | None
+] = ContextVar("vllm_kv_cache_backing", default=None)
+
+
+@contextmanager
+def provide_kv_cache_backing(
+    provider: Callable[[int, torch.device], torch.Tensor | None],
+) -> Iterator[None]:
+    """Supply the KV cache's backing buffer.
+
+    ``allocate_kv_cache`` calls ``provider(nbytes, device)`` instead of
+    allocating its single backing buffer. The provider returns an ``int8``
+    tensor of ``nbytes`` (e.g. a view of memory shared with another process),
+    already initialized, or ``None`` to fall back to the default allocation.
+    """
+    token = _KV_CACHE_BACKING.set(provider)
+    try:
+        yield
+    finally:
+        _KV_CACHE_BACKING.reset(token)
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -649,7 +673,16 @@ def _allocate_kv_cache_buffer(raw_size: int, device: torch.device) -> torch.Tens
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    return torch.zeros(buf_size, dtype=torch.int8, device=device)
+    provider = _KV_CACHE_BACKING.get()
+    buf = provider(buf_size, device) if provider is not None else None
+    if buf is None:
+        buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    elif buf.dtype != torch.int8 or buf.numel() != buf_size:
+        raise ValueError(
+            f"KV cache backing provider returned {buf.dtype} x {buf.numel()}, "
+            f"expected int8 x {buf_size}"
+        )
+    return buf
 
 
 def prepare_kernel_block_sizes(
@@ -742,10 +775,16 @@ def request_memory(
     init_snapshot: MemorySnapshot,
     cache_config: CacheConfig,
     external_weight_memory: int = 0,
+    reclaimable_memory: int = 0,
 ) -> int:
     """Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
+
+    ``reclaimable_memory`` is in use at startup but will become this engine's
+    (e.g. a KV cache held for it by the weight cache daemon), so it counts as
+    free for the check.
     """
+    free_memory = init_snapshot.free_memory + reclaimable_memory
     gpu_memory_utilization = cache_config.resolved_gpu_memory_utilization
     requested_memory = math.ceil(init_snapshot.total_memory * gpu_memory_utilization)
 
@@ -764,7 +803,7 @@ def request_memory(
         # With the extensible KV cache the budget is only a cap; exceeding free
         # memory over-reserves address space rather than pages.
         if (
-            init_snapshot.free_memory < engine_memory
+            free_memory < engine_memory
             and not cache_config.enable_extensible_kv_cache
         ):
             raise ValueError(
@@ -788,7 +827,7 @@ def request_memory(
         return engine_memory
 
     if (
-        init_snapshot.free_memory < requested_memory
+        free_memory < requested_memory
         and not cache_config.enable_extensible_kv_cache
     ):
         # With the extensible KV cache the budget is only a cap; exceeding free

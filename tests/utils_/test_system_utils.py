@@ -129,3 +129,42 @@ raise SystemExit(1 if hung else proc.exitcode)
     env = os.environ | {"VLLM_WORKER_MULTIPROC_METHOD": "fork"}
     result = subprocess.run([sys.executable, "-c", script], env=env, timeout=120)
     assert result.returncode == 0
+
+
+_PARENT_SCRIPT = """
+import multiprocessing
+import time
+
+from vllm.utils.system_utils import kill_when_parent_exits
+
+
+def child(ready):
+    kill_when_parent_exits()
+    ready.put(None)
+    time.sleep(120)
+
+
+if __name__ == "__main__":
+    ready = multiprocessing.get_context("spawn").Queue()
+    proc = multiprocessing.get_context("spawn").Process(target=child, args=(ready,))
+    proc.start()
+    ready.get(timeout=120)
+    print(proc.pid, flush=True)
+    time.sleep(120)
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
+def test_kill_when_parent_exits(tmp_path):
+    script = tmp_path / "parent.py"
+    script.write_text(_PARENT_SCRIPT)
+    parent = subprocess.Popen(
+        [sys.executable, str(script)], stdout=subprocess.PIPE, text=True
+    )
+    child = psutil.Process(int(parent.stdout.readline()))
+    assert child.is_running()
+    parent.kill()
+    parent.wait()
+    # Reparented, the child may linger as a zombie until it is reaped.
+    _, alive = psutil.wait_procs([child], timeout=10)
+    assert not alive or child.status() == psutil.STATUS_ZOMBIE

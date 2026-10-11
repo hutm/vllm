@@ -59,6 +59,7 @@ from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
     get_mp_context,
+    kill_when_parent_exits,
     set_process_title,
 )
 from vllm.utils.torch_utils import (
@@ -982,6 +983,14 @@ class WorkerProc:
         # Either SIGTERM or SIGINT will terminate the worker
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+            kv_restore_enabled,
+        )
+
+        if kv_restore_enabled(kwargs["vllm_config"]):
+            # A worker outliving its engine core keeps the KV pool it writes.
+            kill_when_parent_exits()
 
         # Publish the logical-to-physical mapping early so topology helpers
         # work before init_device (needed by set_worker_net_device below).

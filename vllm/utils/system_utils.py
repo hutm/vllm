@@ -220,6 +220,23 @@ def set_process_title(
     setproctitle.setproctitle(f"{prefix}::{name}")
 
 
+def kill_when_parent_exits() -> None:
+    """Have the kernel SIGKILL this process once its parent exits (Linux
+    ``PR_SET_PDEATHSIG``), e.g. so that it cannot keep writing GPU memory that
+    another process takes over. The parent is the thread that started this
+    process, so it must not be a short-lived thread. No-op off Linux."""
+    if not sys.platform.startswith("linux"):
+        return
+    PR_SET_PDEATHSIG = 1
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    # The parent may have exited before the prctl.
+    parent = multiprocessing.parent_process()
+    if parent is not None and not parent.is_alive():
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
 def decorate_logs(
     process_name: str | None = None, *, skip_if_decorated: bool = False
 ) -> None:

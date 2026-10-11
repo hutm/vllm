@@ -45,6 +45,7 @@ from vllm.model_executor.model_loader.weight_cache.vmm import (
 )
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.network_utils import get_distributed_init_method, get_open_port
+from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 if typing.TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -250,6 +251,10 @@ class PreloadSubcommand(CLISubcommand):
                 )
             )
 
+        # Daemons load and post-process weights like engine workers do; cap
+        # their torch CPU threads the same way. Uncapped, every daemon sizes its
+        # pool to the host's cores, and a CPU-limited container throttles.
+        set_multiprocessing_worker_envs(len(groups) * len(placements))
         ctx = multiprocessing.get_context("spawn")
         ready_queue: multiprocessing.Queue[tuple[str, int]] = ctx.Queue()
         # Local index == device index; global rank enumerates DP, PP, then TP.

@@ -104,6 +104,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.parallel_state import set_custom_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -307,6 +308,9 @@ class WeightCacheDaemon:
 
     def load_model(self) -> None:
         torch.accelerator.set_device_index(self.local_rank)
+        set_custom_all_reduce(
+            not self.vllm_config.parallel_config.disable_custom_all_reduce
+        )
         # Outside the config context so the daemon keeps its own rendezvous
         # instead of the engine's; model parallel groups (TP/DP/EP) are then
         # carved out of this world group like in the engine.

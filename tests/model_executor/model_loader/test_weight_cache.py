@@ -7,7 +7,10 @@ warm restarts (weights mapped from the daemon via CUDA IPC) must both serve
 identical outputs.
 """
 
+import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -331,6 +334,100 @@ def test_vmm_fd_engine_keeps_serving_after_daemon_dies(vllm_runner):
 
     assert warm_outputs == baseline_outputs
     assert after_kill_outputs == baseline_outputs
+
+
+_KV_RESTORE_ENGINE = """
+import json, sys, time
+from vllm import LLM, SamplingParams
+cfg = json.loads(sys.argv[1])
+llm = LLM(
+    model=cfg["model"],
+    load_format="ipc_cache",
+    model_loader_extra_config={
+        "socket_dir": cfg["socket_dir"],
+        "fallback": False,
+        "kv_restore": cfg["kv_restore"],
+    },
+    gpu_memory_utilization=0.3,
+    enforce_eager=True,
+    max_num_seqs=1,
+    enable_prefix_caching=True,
+)
+sp = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+results = []
+for prompt in cfg["prompts"]:
+    start = time.perf_counter()
+    out = llm.generate([prompt], sp, use_tqdm=False)[0]
+    results.append(
+        {
+            "text": out.outputs[0].text,
+            "cached_tokens": out.num_cached_tokens,
+            "prompt_tokens": len(out.prompt_token_ids),
+            "latency_s": time.perf_counter() - start,
+        }
+    )
+print("KV_RESTORE_RESULT " + json.dumps(results), flush=True)
+if cfg["hold"]:
+    time.sleep(3600)
+"""
+
+
+def _run_kv_restore_engine(cfg: dict, hold: bool = False):
+    """Run one engine in its own process group; return (results, process)."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _KV_RESTORE_ENGINE, json.dumps({**cfg, "hold": hold})],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    log = []
+    for line in proc.stdout:
+        log.append(line)
+        if line.startswith("KV_RESTORE_RESULT "):
+            return json.loads(line.split(" ", 1)[1]), proc, log
+    proc.wait()
+    raise AssertionError("engine exited without results:\n" + "".join(log[-60:]))
+
+
+def test_kv_restore_survives_engine_crash():
+    """An engine SIGKILLed mid-life leaves its KV cache with the daemon; the
+    next engine re-attaches it and serves the same prompts from the restored
+    prefix cache, with identical greedy outputs."""
+    if not current_platform.is_cuda():
+        pytest.skip("KV restore needs CUDA VMM")
+    model = "Qwen/Qwen3-0.6B"
+    prefix = " ".join(
+        f"Fact {i}: the weight cache daemon keeps state across restarts."
+        for i in range(120)
+    )
+    prompts = [
+        prefix + " Question: what does the daemon keep?",
+        prefix + " Question: what survives a restart?",
+    ]
+    with WeightCacheDaemon(model, tp_size=1) as d:
+        cfg = {"model": model, "socket_dir": d.socket_dir, "prompts": prompts}
+        cold, _, _ = _run_kv_restore_engine({**cfg, "kv_restore": False})
+
+        warm_a, engine_a, _ = _run_kv_restore_engine(
+            {**cfg, "kv_restore": True}, hold=True
+        )
+        os.killpg(engine_a.pid, signal.SIGKILL)
+        engine_a.wait(timeout=60)
+        time.sleep(2)  # let the daemon see the dropped lease
+
+        restored, engine_b, log_b = _run_kv_restore_engine({**cfg, "kv_restore": True})
+        engine_b.wait(timeout=120)
+
+    print("cold", cold, "\nengine A", warm_a, "\nengine B", restored)
+    assert any("imported" in line and "cached blocks" in line for line in log_b)
+    # Engine A started cold: its first prompt had no cache hits.
+    assert warm_a[0]["cached_tokens"] == 0
+    # Engine B's very first request hits the prefix cache engine A built.
+    assert restored[0]["cached_tokens"] > 0.9 * restored[0]["prompt_tokens"] - 16
+    assert [r["text"] for r in restored] == [r["text"] for r in cold]
+    assert [r["text"] for r in warm_a] == [r["text"] for r in cold]
 
 
 def _parallel(**kw):

@@ -86,6 +86,9 @@ class IpcModelLoader(BaseModelLoader):
       the fingerprints mismatch (default: True).
     - connect_timeout_s: socket connect timeout (default: 5.0).
     - state_timeout_s: timeout for the weight-transfer request (default: 300.0).
+    - kv_restore: keep the KV cache, and the prefix cache, in memory held by
+      the daemon so a restarted engine picks it up (default: False). See
+      ``kv_restore.py``.
 
     Note: in zero-copy mode the weights live in the daemon's CUDA IPC
     allocations (or, with the daemon's ``vmm_fd`` transport, in its shared
@@ -108,6 +111,8 @@ class IpcModelLoader(BaseModelLoader):
                 "independently"
             )
         self.mode: str = extra_config.pop("mode", "zero_copy")
+        # Consumed by the worker and engine core (see kv_restore.py).
+        self.kv_restore: bool = bool(extra_config.pop("kv_restore", False))
         self.fallback: bool = extra_config.pop("fallback", True)
         self.connect_timeout_s: float = float(
             extra_config.pop("connect_timeout_s", _CONNECT_TIMEOUT_S)

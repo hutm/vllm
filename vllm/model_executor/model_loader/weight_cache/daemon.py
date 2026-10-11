@@ -88,6 +88,7 @@ import gc
 import multiprocessing
 import os
 import socket
+import threading
 from collections.abc import Callable
 
 import torch
@@ -106,6 +107,10 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+    KVRestoreStore,
+    serve_kv_session,
+)
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     TensorEntry,
     WeightCacheKey,
@@ -210,6 +215,8 @@ class WeightCacheDaemon:
             )
         self.transport = transport
         self.arena: WeightArena | None = None
+        # Engines' KV memory (as fds) and prefix directory for KV restore.
+        self.kv_store = KVRestoreStore()
         parallel_config = vllm_config.parallel_config
         self.tp_size = parallel_config.tensor_parallel_size
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -441,7 +448,18 @@ class WeightCacheDaemon:
     def _handle_connection(self, conn: socket.socket) -> None:
         request = recv_msg(conn)
         cmd = request.get("cmd")
-        if cmd == "get_state":
+        if cmd in ("kv_attach", "kv_directory"):
+            # Persistent KV session: the open connection is the lease, so it
+            # runs on its own thread with its own copy of the socket.
+            threading.Thread(
+                target=serve_kv_session,
+                args=(self.kv_store, conn.dup(), request),
+                name=f"vllm-kv-session-{cmd}",
+                daemon=True,
+            ).start()
+        elif cmd == "kv_probe":
+            send_msg(conn, {"status": "ok", "pool": self.kv_store.probe()})
+        elif cmd == "get_state":
             self._handle_get_state(conn, request)
         elif cmd == "get_memory":
             send_msg(

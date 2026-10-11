@@ -63,6 +63,12 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
+from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+    KVRestoreClient,
+    kv_layout_key,
+    kv_restore_enabled,
+)
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
     zero_weights,
@@ -109,7 +115,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
 from .gpu.warmup import warmup_kernels
-from .utils import request_memory
+from .utils import provide_kv_cache_backing, request_memory
 
 logger = init_logger(__name__)
 
@@ -541,8 +547,15 @@ class Worker(WorkerBase):
 
             # take current memory snapshot after external weights are ready
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            # KV memory a previous engine left with the weight cache daemon is
+            # either re-attached as this engine's KV cache or freed before the
+            # engine allocates its own.
+            pool = self.kv_restore_probe()
             self.requested_memory = request_memory(
-                init_snapshot, self.cache_config, external_weight_memory
+                init_snapshot,
+                self.cache_config,
+                external_weight_memory,
+                reclaimable_memory=pool["size"] if pool and not pool["busy"] else 0,
             )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -890,6 +903,8 @@ class Worker(WorkerBase):
             if has_kv_transfer_group()
             else None
         )
+        if mem_pool_context is None and kv_restore_enabled(self.vllm_config):
+            mem_pool_context = self._kv_restore_backing(kv_cache_config)
         if mem_pool_context is None:
             mem_pool_context = self._maybe_get_memory_pool_context(
                 tag="kv_cache", kv_cache_config=kv_cache_config
@@ -914,6 +929,35 @@ class Worker(WorkerBase):
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
+
+    def _kv_restore_client(self) -> KVRestoreClient:
+        client = getattr(self, "_kv_restore", None)
+        if client is None:
+            loader = IpcModelLoader(self.load_config)
+            client = self._kv_restore = KVRestoreClient(loader._resolve_socket_path())
+        return client
+
+    def kv_restore_probe(self) -> dict | None:
+        """The KV pool this GPU's weight cache daemon holds, if KV restore is
+        enabled and it holds one."""
+        if not kv_restore_enabled(self.vllm_config):
+            return None
+        return self._kv_restore_client().probe()
+
+    def kv_restore_status(self) -> dict | None:
+        client = getattr(self, "_kv_restore", None)
+        return None if client is None else client.status()
+
+    def _kv_restore_backing(self, kv_cache_config: KVCacheConfig):
+        if self.vllm_config.model_config.enable_sleep_mode:
+            raise ValueError("KV restore cannot be combined with sleep mode")
+        client = self._kv_restore_client()
+
+        def provider(nbytes: int, device: torch.device) -> torch.Tensor | None:
+            key = kv_layout_key(kv_cache_config, nbytes, self.vllm_config)
+            return client.attach(key, nbytes, kv_cache_config.num_blocks, device)
+
+        return provide_kv_cache_backing(provider)
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

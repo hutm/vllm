@@ -31,6 +31,12 @@ from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+    KV_RESTORE_BLOCK_POOL,
+    KVRestoreBlockPool,
+    kv_layout_summary,
+    kv_restore_enabled,
+)
 from vllm.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
@@ -167,6 +173,17 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
+        kv_restore = kv_restore_enabled(vllm_config)
+        if kv_restore:
+            cache_config = vllm_config.cache_config
+            if cache_config.block_pool_cls is None:
+                cache_config.block_pool_cls = KV_RESTORE_BLOCK_POOL
+            elif not issubclass(cache_config.get_block_pool_cls(), KVRestoreBlockPool):
+                raise ValueError(
+                    "KV restore needs block_pool_cls to be KVRestoreBlockPool or "
+                    f"a subclass, got {cache_config.block_pool_cls!r}"
+                )
+
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -234,6 +251,9 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
             )
+        if kv_restore:
+            # After init_none_hash: the directory is keyed by NONE_HASH.
+            self._start_kv_restore()
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -320,6 +340,9 @@ class EngineCore:
 
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
+
+        if has_kv_cache and kv_restore_enabled(vllm_config):
+            self._pin_kv_restore_num_blocks(vllm_config)
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
@@ -412,6 +435,50 @@ class EngineCore:
                 elapsed,
             )
         return scheduler_kv_cache_config
+
+    def _pin_kv_restore_num_blocks(self, vllm_config: VllmConfig) -> None:
+        """Size the KV cache like the pool the weight cache daemons hold, so
+        a restarted engine can re-attach it."""
+        cache_config = vllm_config.cache_config
+        if cache_config.num_gpu_blocks_override is not None:
+            return
+        probed: list[dict | None] = self.collective_rpc("kv_restore_probe")
+        pools = [p for p in probed if p is not None and not p["busy"]]
+        if not pools or len(pools) != len(probed):
+            return
+        summary = kv_layout_summary(vllm_config)
+        mismatch = sorted(
+            {k for p in pools for k, v in summary.items() if p["layout"].get(k) != v}
+        )
+        if mismatch:
+            logger.warning(
+                "KV restore: the retained KV pool was built with a different %s; "
+                "it will be replaced by an empty KV cache",
+                ", ".join(mismatch),
+            )
+            return
+        num_blocks = {p["num_blocks"] for p in pools}
+        if len(num_blocks) == 1:
+            cache_config.num_gpu_blocks_override = num_blocks.pop()
+            logger.info(
+                "KV restore: sizing the KV cache to the daemon-held pool (%d blocks)",
+                cache_config.num_gpu_blocks_override,
+            )
+
+    def _start_kv_restore(self) -> None:
+        block_pool = getattr(
+            getattr(self.scheduler, "kv_cache_manager", None), "block_pool", None
+        )
+        if not isinstance(block_pool, KVRestoreBlockPool):
+            return
+        statuses: list[dict | None] = self.collective_rpc("kv_restore_status")
+        if not statuses or statuses[0] is None:
+            return
+        block_pool.start_kv_restore(
+            statuses[0]["socket_path"],
+            [s["generation"] if s else None for s in statuses],
+            restored=all(s and s["restored"] for s in statuses),
+        )
 
     def _initialize_effective_attention_block_size(self) -> None:
         cache_config = self.vllm_config.cache_config

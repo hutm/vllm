@@ -145,6 +145,21 @@ class PreloadSubcommand(CLISubcommand):
             "for single-node.",
         )
         parser.add_argument(
+            "--kv-drop",
+            action="store_true",
+            help="Instead of launching daemons, ask the running daemons in "
+            "--weight-cache-socket-dir to free the KV caches they retain for "
+            "KV restore (see `kv_restore` in --model-loader-extra-config). "
+            "Refused for a pool an engine is using, unless --force.",
+        )
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="With --kv-drop: also drop pools that engines are using. "
+            "The daemon releases its references; each engine keeps its own "
+            "mapping until it exits, and nothing is restored afterwards.",
+        )
+        parser.add_argument(
             "--weight-cache-health-port",
             type=int,
             default=None,
@@ -159,6 +174,14 @@ class PreloadSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if args.kv_drop:
+            from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+                drop_kv_pools,
+            )
+
+            ok, lines = drop_kv_pools(args.weight_cache_socket_dir, args.force)
+            print("\n".join(lines))
+            sys.exit(0 if ok else 1)
         # Imported here so `vllm --help` and friends stay free of torch.
         from vllm.model_executor.model_loader.weight_cache.daemon import (
             _reject_unsupported_parallelism,

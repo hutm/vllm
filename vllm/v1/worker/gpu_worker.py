@@ -59,6 +59,13 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
+from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+    KVRestoreClient,
+    kv_layout_key,
+    kv_layout_summary,
+    kv_restore_enabled,
+)
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
     zero_weights,
@@ -110,8 +117,9 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
+from .gpu.eplb_utils import preserve_serving_state
 from .gpu.warmup import run_mixed_prefill_decode_warmup, warmup_kernels
-from .utils import request_memory
+from .utils import kv_cache_allocator, request_memory
 
 logger = init_logger(__name__)
 
@@ -243,6 +251,8 @@ class Worker(WorkerBase):
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
+        # KV restore session with the weight cache daemon, if enabled.
+        self._kv_restore: KVRestoreClient | None = None
 
     @property
     def sleep_mode_backend(self) -> "SleepModeBackend":
@@ -527,8 +537,15 @@ class Worker(WorkerBase):
             self.external_weight_memory = get_model_loader(
                 self.load_config
             ).get_external_weight_memory(self.vllm_config)
+            # KV memory a previous engine left with the weight cache daemon is
+            # either re-attached as this engine's KV cache or freed before the
+            # engine allocates its own.
+            pool = self.kv_restore_probe()
             self.requested_memory = request_memory(
-                init_snapshot, self.cache_config, self.external_weight_memory
+                init_snapshot,
+                self.cache_config,
+                self.external_weight_memory,
+                reclaimable_memory=pool["size"] if pool and not pool["busy"] else 0,
             )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -863,10 +880,15 @@ class Worker(WorkerBase):
             # If the connector provides a custom memory pool (e.g. Mooncake
             # NVLink/BAREX), use it for KV cache allocation; otherwise fall
             # back to the standard CuMem pool.
-            if has_kv_transfer_group():
-                mem_pool_context = get_kv_transfer_group().get_mem_pool_context()
-                if mem_pool_context is not None:
-                    allocation_context = mem_pool_context
+            mem_pool_context = (
+                get_kv_transfer_group().get_mem_pool_context()
+                if has_kv_transfer_group()
+                else None
+            )
+            if mem_pool_context is not None:
+                allocation_context = mem_pool_context
+            elif kv_restore_enabled(self.vllm_config):
+                allocation_context = self._kv_restore_backing(kv_cache_config)
 
         # Offload KV-init state, except on XPU, whose outermost pool would win.
         runtime_pool = (
@@ -1000,6 +1022,43 @@ class Worker(WorkerBase):
         )
         return num_blocks
 
+    def _kv_restore_client(self) -> KVRestoreClient:
+        if self._kv_restore is None:
+            loader = IpcModelLoader(self.load_config)
+            self._kv_restore = KVRestoreClient(loader._resolve_socket_path())
+        return self._kv_restore
+
+    def kv_restore_probe(self) -> dict | None:
+        """The KV pool this GPU's weight cache daemon holds, if KV restore is
+        enabled and it holds one."""
+        if not kv_restore_enabled(self.vllm_config):
+            return None
+        return self._kv_restore_client().probe()
+
+    def kv_restore_status(self) -> dict | None:
+        return None if self._kv_restore is None else self._kv_restore.status()
+
+    def _kv_restore_backing(self, kv_cache_config: KVCacheConfig):
+        if self.vllm_config.model_config.enable_sleep_mode:
+            raise ValueError("KV restore cannot be combined with sleep mode")
+        client = self._kv_restore_client()
+        device = self.device
+        assert device is not None
+
+        def allocate(nbytes: int) -> torch.Tensor:
+            buf = client.attach(
+                kv_layout_key(kv_cache_config, nbytes, self.vllm_config),
+                nbytes,
+                kv_cache_config.num_blocks,
+                device,
+                layout=kv_layout_summary(self.vllm_config),
+            )
+            if buf is None:
+                buf = torch.zeros(nbytes, dtype=torch.int8, device=device)
+            return buf
+
+        return kv_cache_allocator(allocate)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(
         self, num_committable_kv_blocks: int | None = None
@@ -1052,16 +1111,32 @@ class Worker(WorkerBase):
             )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
-        # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
-        kernel_warmup(self)
+        # The V2 runner's warmup steps write KV blocks 1..N, which on a
+        # restored KV cache hold prefix-cache entries: send those writes to
+        # the null block instead.
+        restored_kv = (
+            self.use_v2_model_runner
+            and self._kv_restore is not None
+            and self._kv_restore.restored
+        )
+        with (
+            preserve_serving_state(self.model_runner) if restored_kv else nullcontext()
+        ):
+            # Warmup and tune the kernels used during model execution before
+            # cuda graph capture.
+            kernel_warmup(self)
 
-        if self.use_v2_model_runner:
-            if self.vllm_config.kernel_config.enable_jit_warmup:
-                # A workspace resize after capture frees what the graphs point at.
+            if (
+                self.use_v2_model_runner
+                and self.vllm_config.kernel_config.enable_jit_warmup
+            ):
+                # A workspace resize after capture frees what the graphs
+                # point at.
                 warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens
                 )
+
+        if self.use_v2_model_runner:  # noqa: SIM102
             if (
                 self.cache_config.enable_extensible_kv_cache
                 and not self.model_config.is_encoder_decoder

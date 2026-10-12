@@ -3130,6 +3130,13 @@ class VllmConfig:
                 "elastic EP scale-up skips warmup and reuses the profiled KV "
                 "cache size, so no measurement would size the cache"
             )
+        elif self.load_config.load_format == "ipc_cache" and (
+            self.load_config.model_loader_extra_config or {}
+        ).get("kv_restore"):
+            unsupported = (
+                "KV restore keeps the KV cache in one allocation held by the "
+                "weight cache daemon"
+            )
         elif (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.uses_custom_mem_pool()

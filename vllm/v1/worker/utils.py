@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
@@ -42,6 +44,26 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+_KV_CACHE_ALLOCATOR: ContextVar[Callable[[int], torch.Tensor] | None] = ContextVar(
+    "vllm_kv_cache_allocator", default=None
+)
+
+
+@contextmanager
+def kv_cache_allocator(allocate: Callable[[int], torch.Tensor]) -> Iterator[None]:
+    """Let ``allocate(nbytes)`` provide the KV cache's backing buffer.
+
+    ``allocate_kv_cache`` calls it instead of allocating and zero-filling its
+    single backing buffer. It returns an initialized ``int8`` tensor of
+    ``nbytes`` on the KV cache device, e.g. a view of memory shared with
+    another process.
+    """
+    token = _KV_CACHE_ALLOCATOR.set(allocate)
+    try:
+        yield
+    finally:
+        _KV_CACHE_ALLOCATOR.reset(token)
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -579,21 +601,16 @@ def allocate_kv_cache(
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
-    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
-    # are created lazily on the first qualifying GEMM. Force that now, before
-    # the giant backing allocation below: if one landed in this segment's
-    # rounding tail it would pin the whole segment at engine shutdown.
-    if current_platform.is_rocm():
-        warmup_rocm_skinny_gemm_workspaces(device)
-        # Pad to the page granularity MoRIIO needs to register the shared
-        # backing as a single RDMA memory region. Other platforms keep the
-        # exact-size allocation (see #53974), so anything reading
-        # storage.nbytes() has to tolerate the tail on ROCm alone.
-        page_size = 4096
-        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+    allocate = _KV_CACHE_ALLOCATOR.get()
+    if allocate is not None:
+        buf = allocate(raw_size)
+        if buf.dtype != torch.int8 or buf.numel() != raw_size:
+            raise ValueError(
+                f"KV cache allocator returned {buf.dtype} x {buf.numel()}, "
+                f"expected int8 x {raw_size}"
+            )
     else:
-        buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+        buf = _allocate_kv_cache_buffer(raw_size, device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -625,6 +642,24 @@ def allocate_kv_cache(
         )
         kv_caches.update(zip(tensor.layers, views))
     return kv_caches
+
+
+def _allocate_kv_cache_buffer(raw_size: int, device: torch.device) -> torch.Tensor:
+    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
+    # are created lazily on the first qualifying GEMM. Force that now, before
+    # the giant backing allocation below: if one landed in this segment's
+    # rounding tail it would pin the whole segment at engine shutdown.
+    if current_platform.is_rocm():
+        warmup_rocm_skinny_gemm_workspaces(device)
+        # Pad to the page granularity MoRIIO needs to register the shared
+        # backing as a single RDMA memory region. Other platforms keep the
+        # exact-size allocation (see #53974), so anything reading
+        # storage.nbytes() has to tolerate the tail on ROCm alone.
+        page_size = 4096
+        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+    else:
+        buf_size = raw_size
+    return torch.zeros(buf_size, dtype=torch.int8, device=device)
 
 
 def prepare_kernel_block_sizes(
@@ -717,10 +752,16 @@ def request_memory(
     init_snapshot: MemorySnapshot,
     cache_config: CacheConfig,
     external_weight_memory: int = 0,
+    reclaimable_memory: int = 0,
 ) -> int:
     """Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
+
+    ``reclaimable_memory`` is in use at startup but will become this engine's
+    (e.g. a KV cache held for it by the weight cache daemon), so it counts as
+    free for the check.
     """
+    free_memory = init_snapshot.free_memory + reclaimable_memory
     requested_memory = math.ceil(
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
@@ -737,7 +778,7 @@ def request_memory(
                 f"{format_gib(requested_memory)} GiB). Increase GPU memory "
                 "utilization or reduce GPU memory used by other processes."
             )
-        if init_snapshot.free_memory < engine_memory:
+        if free_memory < engine_memory:
             raise ValueError(
                 f"Free memory on device {init_snapshot.device_} "
                 f"({format_gib(init_snapshot.free_memory)}/"
@@ -758,7 +799,7 @@ def request_memory(
         )
         return engine_memory
 
-    if init_snapshot.free_memory < requested_memory:
+    if free_memory < requested_memory:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"

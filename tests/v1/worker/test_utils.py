@@ -1452,3 +1452,55 @@ def test_request_memory_charges_external_weights():
         request_memory(
             _memory_snapshot(total_gib=100, free_gib=10), cache_config, 70 * GiB_bytes
         )
+
+
+def test_request_memory_counts_reclaimable_memory_as_free():
+    """A KV cache held for this engine elsewhere becomes the engine's own,
+    so it does not count against the startup free-memory check."""
+    cache_config = CacheConfig(gpu_memory_utilization=0.9)
+    snapshot = _memory_snapshot(total_gib=100, free_gib=60)
+    with pytest.raises(ValueError, match="less than desired"):
+        request_memory(snapshot, cache_config)
+    assert (
+        request_memory(snapshot, cache_config, reclaimable_memory=30 * GiB_bytes)
+        == 90 * GiB_bytes
+    )
+
+
+def test_kv_cache_allocator_supplies_the_buffer():
+    """allocate_kv_cache views the allocator's buffer as-is: same memory, and
+    its contents are not zero-filled."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.utils import allocate_kv_cache, kv_cache_allocator
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    num_blocks, page = 4, spec.page_size_bytes
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * page,
+                layers=["l0"],
+                layer_stride=num_blocks * page,
+                block_stride=page,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["l0"], spec)],
+    )
+    backing = torch.full((num_blocks * page,), 7, dtype=torch.int8)
+    with kv_cache_allocator(lambda nbytes: backing):
+        caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    cache = caches["l0"]
+    assert cache.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert torch.all(cache.view(torch.int8) == 7)
+    # Without an allocator the buffer is freshly zeroed.
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    assert not torch.any(caches["l0"].view(torch.int8))

@@ -1041,20 +1041,24 @@ class Worker(WorkerBase):
             )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
-        # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
-        kernel_warmup(self)
+        # The V2 runner's warmup steps write KV blocks 1..N: here, restored
+        # prefix-cache blocks or the live blocks of a standby's writer.
+        # Redirect them to the null block, as the elastic EP warmup does, so
+        # the kernels still get compiled.
+        holds_live_kv = self.use_v2_model_runner and self._kv_restore_holds_live_kv()
+        if holds_live_kv:
+            from vllm.v1.worker.gpu.eplb_utils import preserve_serving_state
+        with (
+            preserve_serving_state(self.model_runner)
+            if holds_live_kv
+            else nullcontext()
+        ):
+            # Warmup and tune the kernels used during model execution before
+            # cuda graph capture.
+            kernel_warmup(self)
 
-        if self.use_v2_model_runner:  # noqa: SIM102
-            if self.vllm_config.kernel_config.enable_jit_warmup:
-                if self._kv_restore_holds_live_kv():
-                    # Its steps write KV blocks 1..N: here, restored prefix-
-                    # cache blocks or the live blocks of a standby's writer.
-                    logger.info(
-                        "KV restore: skipping the kernel warmup steps, which "
-                        "would overwrite blocks of the restored KV cache"
-                    )
-                else:
+            if self.use_v2_model_runner:  # noqa: SIM102
+                if self.vllm_config.kernel_config.enable_jit_warmup:
                     # A workspace resize after capture frees what the graphs
                     # point at.
                     warmup_kernels(

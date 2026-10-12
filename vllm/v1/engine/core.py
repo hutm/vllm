@@ -205,6 +205,10 @@ class EngineCore:
         )
 
         kv_restore = kv_restore_enabled(vllm_config)
+        # Until promoted, a standby maps the writer's live KV cache.
+        self._kv_restore_standby = (
+            kv_restore and kv_restore_role(vllm_config) == "standby"
+        )
         if kv_restore:
             if vllm_config.aux_output_config.enabled:
                 # Restored blocks are prefix-cache hits without the aux
@@ -1351,6 +1355,12 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if self._kv_restore_standby and not self._kv_restore_promoted:
+            # Its blocks would overwrite the KV cache the writer is serving.
+            raise RuntimeError(
+                "KV restore standby: requests are rejected until the engine "
+                "is promoted with kv_restore_promote"
+            )
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.

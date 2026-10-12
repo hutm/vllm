@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -28,6 +28,9 @@ from vllm.v1.core.kv_cache_utils import (
     to_event_extra_keys,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -270,6 +273,7 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        newly_cached: list[KVCacheBlock] = []
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -299,6 +303,10 @@ class BlockPool:
             )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+            newly_cached.append(blk)
+
+        if newly_cached:
+            self.on_blocks_cached(newly_cached, kv_cache_group_id)
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -750,6 +758,7 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        self.on_cached_block_evicted(block, evicted_hashes)
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
@@ -806,6 +815,62 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
+
+    def import_cached_blocks(
+        self,
+        block_hashes: Sequence[BlockHashWithGroupId],
+        block_ids: Sequence[int],
+        num_tokens: Sequence[int | None] | None = None,
+    ) -> list[int]:
+        """Register free blocks that already hold valid KV as cache entries.
+
+        For KV produced outside the scheduler: memory that outlived a previous
+        engine process, a restored snapshot, or a transfer that wrote straight
+        into these blocks. Block ``block_ids[i]`` becomes reachable under
+        ``block_hashes[i]`` through ``get_cached_block`` and is placed at the
+        most-recently-used end of the free queue, like a block whose request
+        just finished.
+
+        A block is skipped if it is the null block, is in use
+        (``ref_cnt > 0``), or if its hash is already cached by another block.
+        A free block that holds other cache entries is evicted first.
+        ``num_tokens[i]`` is the token length the hash covers (as
+        ``block_hash_num_tokens``), if known.
+
+        Lifecycle hooks other than ``on_cached_block_evicted`` are not called,
+        and no KV cache events are emitted: the caller owns the external state
+        it imports from.
+
+        Returns:
+            The ids of the blocks that were imported.
+
+        """
+        if len(block_hashes) != len(block_ids):
+            raise ValueError("block_hashes and block_ids must have the same length")
+        if num_tokens is not None and len(num_tokens) != len(block_ids):
+            raise ValueError("num_tokens must match block_ids in length")
+        if not self.enable_caching:
+            return []
+
+        imported: list[KVCacheBlock] = []
+        for i, (block_hash, block_id) in enumerate(zip(block_hashes, block_ids)):
+            if not 0 <= block_id < self.num_gpu_blocks:
+                raise ValueError(f"Invalid block_id {block_id}")
+            block = self.blocks[block_id]
+            if block.is_null or block.ref_cnt != 0:
+                continue
+            if self.cached_block_hash_to_block.get_one_block(block_hash) is not None:
+                continue
+            self._maybe_evict_cached_block(block)
+            self._insert_block_hash(
+                block_hash,
+                block,
+                num_tokens=None if num_tokens is None else num_tokens[i],
+            )
+            self.free_block_queue.remove(block)
+            imported.append(block)
+        self.free_block_queue.append_n(imported)
+        return [block.block_id for block in imported]
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -867,6 +932,37 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    # -- Lifecycle hooks -------------------------------------------------------
+    # No-ops here. A pool selected with ``--block-pool-cls`` overrides them to
+    # observe the KV block lifecycle, e.g. to account for KV memory owned
+    # outside this process or to keep an external index of cached blocks.
+    # They run synchronously on the scheduler thread and must be cheap.
+
+    def on_cached_block_evicted(
+        self, block: KVCacheBlock, block_hashes: list[BlockHashWithGroupId]
+    ) -> None:
+        """Called after ``block`` loses its prefix-cache entries
+        ``block_hashes`` because it is reused for new data or evicted with
+        ``evict_blocks``. ``reset_prefix_cache`` clears every entry without
+        per-block calls; override it to observe a full reset."""
+
+    def on_blocks_cached(
+        self, blocks: list[KVCacheBlock], kv_cache_group_id: int
+    ) -> None:
+        """Called after ``cache_full_blocks`` adds ``blocks`` (full blocks of
+        group ``kv_cache_group_id``) to the prefix cache."""
+
+    def on_step_scheduled(self, scheduler_output: "SchedulerOutput") -> None:
+        """Called at the end of ``Scheduler.schedule`` with the step it just
+        built. Blocks cached since the previous call belong to this step: their
+        KV is written by it (or was written before it)."""
+
+    def on_step_output_processed(self, scheduler_output: "SchedulerOutput") -> None:
+        """Called when ``Scheduler.update_from_output`` starts processing the
+        output of ``scheduler_output``. Every GPU write enqueued by that step
+        and earlier steps has completed, so the KV of blocks cached before the
+        matching ``on_step_scheduled`` is complete."""
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.

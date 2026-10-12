@@ -950,6 +950,12 @@ class Worker(WorkerBase):
             )
         return client
 
+    def _kv_restore_holds_live_kv(self) -> bool:
+        """Whether the KV cache came back from the daemon (a restart or a
+        standby), so its blocks hold data that must not be overwritten."""
+        client = getattr(self, "_kv_restore", None)
+        return client is not None and client.restored
+
     def kv_restore_probe(self) -> dict | None:
         """The KV pool this GPU's weight cache daemon holds, if KV restore is
         enabled and it holds one."""
@@ -1041,10 +1047,19 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:  # noqa: SIM102
             if self.vllm_config.kernel_config.enable_jit_warmup:
-                # A workspace resize after capture frees what the graphs point at.
-                warmup_kernels(
-                    self.model_runner, self.execute_model, self.sample_tokens
-                )
+                if self._kv_restore_holds_live_kv():
+                    # Its steps write KV blocks 1..N: here, restored prefix-
+                    # cache blocks or the live blocks of a standby's writer.
+                    logger.info(
+                        "KV restore: skipping the kernel warmup steps, which "
+                        "would overwrite blocks of the restored KV cache"
+                    )
+                else:
+                    # A workspace resize after capture frees what the graphs
+                    # point at.
+                    warmup_kernels(
+                        self.model_runner, self.execute_model, self.sample_tokens
+                    )
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:

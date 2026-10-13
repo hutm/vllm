@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import product as iprod
 from typing import Any
@@ -43,6 +45,26 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+_KV_CACHE_ALLOCATOR: ContextVar[Callable[[int], torch.Tensor] | None] = ContextVar(
+    "vllm_kv_cache_allocator", default=None
+)
+
+
+@contextmanager
+def kv_cache_allocator(allocate: Callable[[int], torch.Tensor]) -> Iterator[None]:
+    """Let ``allocate(nbytes)`` provide the KV cache's backing buffer.
+
+    ``allocate_kv_cache`` calls it instead of allocating and zero-filling its
+    single backing buffer. It returns an initialized ``int8`` tensor of
+    ``nbytes`` on the KV cache device, e.g. a view of memory shared with
+    another process.
+    """
+    token = _KV_CACHE_ALLOCATOR.set(allocate)
+    try:
+        yield
+    finally:
+        _KV_CACHE_ALLOCATOR.reset(token)
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -415,6 +437,8 @@ def allocate_kv_cache(
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
+    if allocate is None:
+        allocate = _KV_CACHE_ALLOCATOR.get()
     if allocate is not None:
         buf = allocate(raw_size)
     else:
@@ -566,10 +590,16 @@ def request_memory(
     init_snapshot: MemorySnapshot,
     cache_config: CacheConfig,
     external_weight_memory: int = 0,
+    reclaimable_memory: int = 0,
 ) -> int:
     """Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
+
+    ``reclaimable_memory`` is in use at startup but will become this engine's
+    (e.g. a KV cache held for it by the weight cache daemon), so it counts as
+    free for the check.
     """
+    free_memory = init_snapshot.free_memory + reclaimable_memory
     gpu_memory_utilization = cache_config.resolved_gpu_memory_utilization
     requested_memory = math.ceil(init_snapshot.total_memory * gpu_memory_utilization)
 
@@ -587,10 +617,7 @@ def request_memory(
             )
         # With the extensible KV cache the budget is only a cap; exceeding free
         # memory over-reserves address space rather than pages.
-        if (
-            init_snapshot.free_memory < engine_memory
-            and not cache_config.enable_extensible_kv_cache
-        ):
+        if free_memory < engine_memory and not cache_config.enable_extensible_kv_cache:
             raise ValueError(
                 f"Free memory on device {init_snapshot.device_} "
                 f"({format_gib(init_snapshot.free_memory)}/"
@@ -611,10 +638,7 @@ def request_memory(
         )
         return engine_memory
 
-    if (
-        init_snapshot.free_memory < requested_memory
-        and not cache_config.enable_extensible_kv_cache
-    ):
+    if free_memory < requested_memory and not cache_config.enable_extensible_kv_cache:
         # With the extensible KV cache the budget is only a cap; exceeding free
         # memory over-reserves address space rather than pages.
         raise ValueError(

@@ -464,6 +464,42 @@ def test_extensible_kv_cache_off_with_elastic_ep(monkeypatch, requested):
         assert config.cache_config.enable_extensible_kv_cache is False
 
 
+@pytest.mark.parametrize("requested", [None, True])
+def test_extensible_kv_cache_off_with_kv_restore(monkeypatch, requested):
+    """KV restore keeps the KV cache in one allocation held by the weight
+    cache daemon: the extensible cache stays off by default and an explicit
+    request is an error."""
+    from types import SimpleNamespace
+
+    import vllm.platforms
+    from vllm.config.vllm import VllmConfig
+
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(is_cuda_alike=lambda: True)
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            _extensible_kv_cache_resolved=False,
+            enable_extensible_kv_cache=requested,
+            kv_cache_memory_bytes=None,
+            num_gpu_blocks_override=None,
+        ),
+        use_v2_model_runner=True,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        parallel_config=SimpleNamespace(enable_elastic_ep=False),
+        load_config=SimpleNamespace(
+            load_format="ipc_cache", model_loader_extra_config={"kv_restore": True}
+        ),
+        kv_transfer_config=None,
+    )
+    if requested:
+        with pytest.raises(ValueError, match="KV restore"):
+            VllmConfig._resolve_extensible_kv_cache(config)
+    else:
+        VllmConfig._resolve_extensible_kv_cache(config)
+        assert config.cache_config.enable_extensible_kv_cache is False
+
+
 @requires_cuda
 @pytest.mark.parametrize("multi", [False, True])
 def test_extensible_kv_cache_rejects_connector_memory_pool(multi):

@@ -39,6 +39,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     check_ipc_platform_support,
 )
+from vllm.model_executor.model_loader.weight_cache.vmm import (
+    CUDA_IPC,
+    WEIGHT_CACHE_TRANSPORTS,
+)
 from vllm.utils.network_utils import get_distributed_init_method, get_open_port
 
 if typing.TYPE_CHECKING:
@@ -114,6 +118,16 @@ class PreloadSubcommand(CLISubcommand):
             help="Directory for the daemon Unix sockets (default: tempdir).",
         )
         parser.add_argument(
+            "--weight-cache-transport",
+            choices=WEIGHT_CACHE_TRANSPORTS,
+            default=CUDA_IPC,
+            help="How engines map the cached weights. cuda_ipc exports PyTorch "
+            "CUDA IPC handles. vmm_fd packs the weights into one shareable CUDA "
+            "VMM allocation passed as a file descriptor; each engine then holds "
+            "its own reference to the memory. vmm_fd needs CUDA and briefly "
+            "uses twice the model's memory while packing.",
+        )
+        parser.add_argument(
             "--weight-cache-master-port",
             type=int,
             default=None,
@@ -131,6 +145,21 @@ class PreloadSubcommand(CLISubcommand):
             "for single-node.",
         )
         parser.add_argument(
+            "--kv-drop",
+            action="store_true",
+            help="Instead of launching daemons, ask the running daemons in "
+            "--weight-cache-socket-dir to free the KV caches they retain for "
+            "KV restore (see `kv_restore` in --model-loader-extra-config). "
+            "Refused for a pool an engine is using, unless --force.",
+        )
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="With --kv-drop: also drop pools that engines are using. "
+            "The daemon releases its references; each engine keeps its own "
+            "mapping until it exits, and nothing is restored afterwards.",
+        )
+        parser.add_argument(
             "--weight-cache-health-port",
             type=int,
             default=None,
@@ -145,6 +174,14 @@ class PreloadSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if args.kv_drop:
+            from vllm.model_executor.model_loader.weight_cache.kv_restore import (
+                drop_kv_pools,
+            )
+
+            ok, lines = drop_kv_pools(args.weight_cache_socket_dir, args.force)
+            print("\n".join(lines))
+            sys.exit(0 if ok else 1)
         # Imported here so `vllm --help` and friends stay free of torch.
         from vllm.model_executor.model_loader.weight_cache.daemon import (
             _reject_unsupported_parallelism,
@@ -254,6 +291,7 @@ class PreloadSubcommand(CLISubcommand):
                     is_draft,
                     dp_rank,
                     pp_rank,
+                    args.weight_cache_transport,
                 ),
                 name=(
                     f"vllm-weight-cache-{format_daemon_role(is_draft)}-"

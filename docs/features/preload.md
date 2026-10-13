@@ -173,11 +173,62 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 | `fallback` | `true` | Fall back to disk loading when the daemon is unavailable or the fingerprints mismatch. |
 | `connect_timeout_s` | `5.0` | Socket connect timeout in seconds. |
 | `state_timeout_s` | `300.0` | Timeout for the weight-transfer request in seconds. |
+| `kv_restore` | `false` | Keep the KV cache and prefix cache with the daemon across engine restarts (see below). |
 
 The daemon's `--weight-cache-socket-dir` and the loader's `socket_dir` /
 `socket_path` must agree when the default per-user directory is not used.
 Socket paths are derived from the GPU UUID, so they are stable regardless of
 `CUDA_VISIBLE_DEVICES` index remapping.
+
+## KV cache restore
+
+With `"kv_restore": true` the daemon also keeps the engine's KV cache, and the
+prefix cache that indexes it, so a restarted (or crashed) engine serves its
+first requests from the prefix cache instead of recomputing them:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --load-format ipc_cache \
+    --model-loader-extra-config '{"kv_restore": true}'
+```
+
+- Each worker allocates its KV cache as one shareable CUDA VMM allocation and
+  hands its file descriptor to its GPU's daemon. The daemon only holds the
+  descriptor, which keeps the memory alive after the engine exits.
+- The scheduler streams its prefix cache to the daemon: a block is recorded
+  only after the step that wrote it has finished, and removed before its
+  memory can be reused, so a crash never leaves a half-written block behind.
+- A restarted engine with the same KV cache layout maps the same memory and
+  imports the recorded blocks into its prefix cache. Its KV cache is sized to
+  the retained pool automatically.
+
+One engine at a time owns a pool: while it runs, a second engine on the same
+GPU starts without restore. If the layout differs (model, dtype, KV cache
+dtype or layout, block size, per-layer shapes), the daemon logs the differing
+fields, drops the retained pool and the engine starts with an empty KV cache.
+
+The daemon cannot tell a clean engine exit from a crash, so it keeps the pool
+in both cases. The memory is freed when `vllm preload` exits, when an engine
+with a different layout attaches, or on request:
+
+```bash
+vllm preload --kv-drop [--weight-cache-socket-dir DIR] [--force]
+```
+
+`--kv-drop` talks to the running daemons and exits. It refuses to drop a pool
+that an engine is using unless `--force` is given; a forced drop only releases
+the daemon's reference, so that engine keeps its memory until it exits and
+nothing is restored afterwards.
+
+Requirements and limits:
+
+- CUDA only (VMM). Not compatible with sleep mode.
+- Prefix caching hashes must be stable across restarts: the default `sha256`
+  hash uses a fixed seed; with `xxhash`, set `PYTHONHASHSEED`.
+- With tensor parallelism, the prefix cache is imported only if every worker
+  re-attached its own pool.
+- A retained pool keeps its GPU memory allocated after the engine exits, until
+  it is reused or dropped.
 
 ## Limitations
 

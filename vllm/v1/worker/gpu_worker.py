@@ -1088,6 +1088,12 @@ class Worker(WorkerBase):
             )
         return client
 
+    def _kv_restore_holds_live_kv(self) -> bool:
+        """Whether the KV cache came back from the daemon (a restart or a
+        standby), so its blocks hold data that must not be overwritten."""
+        client = getattr(self, "_kv_restore", None)
+        return client is not None and client.restored
+
     def kv_restore_probe(self) -> dict | None:
         """The KV pool this GPU's weight cache daemon held when this worker
         started, if KV restore is enabled and it held one."""
@@ -1187,35 +1193,48 @@ class Worker(WorkerBase):
             )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
-        # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
-        kernel_warmup(self)
+        # The V2 runner's warmup steps write KV blocks 1..N: here, restored
+        # prefix-cache blocks or the live blocks of a standby's writer.
+        # Redirect them to the null block, as the elastic EP warmup does, so
+        # the kernels still get compiled.
+        holds_live_kv = self.use_v2_model_runner and self._kv_restore_holds_live_kv()
+        if holds_live_kv:
+            from vllm.v1.worker.gpu.eplb_utils import preserve_serving_state
+        with (
+            preserve_serving_state(self.model_runner)
+            if holds_live_kv
+            else nullcontext()
+        ):
+            # Warmup and tune the kernels used during model execution before
+            # cuda graph capture.
+            kernel_warmup(self)
 
-        if self.use_v2_model_runner:
-            # An extensible KV cache is sized from the peak of these full-batch
-            # steps, so they also run when JIT warmup is off (enforce_eager).
-            if (
-                self.vllm_config.kernel_config.enable_jit_warmup
-                or self.cache_config.enable_extensible_kv_cache
-            ):
-                # A workspace resize after capture frees what the graphs point at.
-                warmup_kernels(
-                    self.model_runner, self.execute_model, self.sample_tokens
-                )
-            if self.cache_config.enable_extensible_kv_cache:
-                run_kv_cache_sizing_warmup(
-                    self._v2_model_runner(), self.execute_model, self.sample_tokens
-                )
-                # Measure before capture, whose persistent allocations would
-                # hide part of the peak from a later peak - current.
-                kv_cache = self._v2_model_runner().extensible_kv_cache
-                assert kv_cache is not None
-                stats = torch.accelerator.memory_stats(self.device)
-                kv_cache.reserved_headroom_bytes = max(
-                    kv_cache.reserved_headroom_bytes,
-                    stats.get("allocated_bytes.all.peak", 0)
-                    - stats.get("allocated_bytes.all.current", 0),
-                )
+            if self.use_v2_model_runner:
+                # An extensible KV cache is sized from the peak of these full-batch
+                # steps, so they also run when JIT warmup is off (enforce_eager).
+                if (
+                    self.vllm_config.kernel_config.enable_jit_warmup
+                    or self.cache_config.enable_extensible_kv_cache
+                ):
+                    # A workspace resize after capture frees what the graphs
+                    # point at.
+                    warmup_kernels(
+                        self.model_runner, self.execute_model, self.sample_tokens
+                    )
+                if self.cache_config.enable_extensible_kv_cache:
+                    run_kv_cache_sizing_warmup(
+                        self._v2_model_runner(), self.execute_model, self.sample_tokens
+                    )
+                    # Measure before capture, whose persistent allocations would
+                    # hide part of the peak from a later peak - current.
+                    kv_cache = self._v2_model_runner().extensible_kv_cache
+                    assert kv_cache is not None
+                    stats = torch.accelerator.memory_stats(self.device)
+                    kv_cache.reserved_headroom_bytes = max(
+                        kv_cache.reserved_headroom_bytes,
+                        stats.get("allocated_bytes.all.peak", 0)
+                        - stats.get("allocated_bytes.all.current", 0),
+                    )
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:

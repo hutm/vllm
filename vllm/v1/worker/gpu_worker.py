@@ -438,7 +438,16 @@ class Worker(WorkerBase):
     def reset_weights(self) -> None:
         zero_weights(self.model_runner.get_model())
 
-    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+    def _maybe_get_memory_pool_context(
+        self, tag: str, kv_cache_config: KVCacheConfig | None = None
+    ) -> AbstractContextManager:
+        if self.vllm_config.model_config.enable_sleep_mode:
+            backend_context = self.sleep_mode_backend.allocation_context(
+                tag, kv_cache_config=kv_cache_config
+            )
+            if backend_context is not None:
+                return backend_context
+
         if (
             current_platform.is_cuda_alike()
             and not self.vllm_config.model_config.enable_cumem_allocator
@@ -955,7 +964,9 @@ class Worker(WorkerBase):
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
-        allocation_context = self._maybe_get_memory_pool_context(tag="kv_cache")
+        allocation_context = self._maybe_get_memory_pool_context(
+            tag="kv_cache", kv_cache_config=kv_cache_config
+        )
         if self.cache_config.enable_extensible_kv_cache:
             if registers_kv_cache_memory(self.vllm_config):
                 kv_cache_config = pad_kv_cache_segments(

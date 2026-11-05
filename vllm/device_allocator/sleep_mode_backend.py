@@ -22,12 +22,14 @@ from __future__ import annotations
 import importlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Literal
 
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config.model import ModelConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -73,6 +75,29 @@ class SleepModeBackend(ABC):
         (suspended) engine from a healthy-serving one (see RFC #34303)."""
         return self._state
 
+    def allocation_context(
+        self,
+        tag: str,
+        *,
+        kv_cache_config: KVCacheConfig | None = None,
+    ) -> AbstractContextManager | None:
+        """Return the context in which the worker allocates ``tag`` memory.
+
+        The worker allocates weights (``"weights"``), the KV cache
+        (``"kv_cache"``), and other runtime state inside the returned context,
+        so a backend can place them in memory it can suspend and restore
+        (a pluggable allocator, a memory pool, or memory owned by another
+        process). ``kv_cache_config`` is set for ``"kv_cache"``.
+
+        A backend whose context hands back KV memory that already holds valid
+        contents should enter
+        ``vllm.v1.worker.utils.preserve_kv_cache_contents()`` inside it, so
+        the worker does not zero-fill the cache.
+
+        Returning ``None`` keeps the worker's default allocation for the tag.
+        """
+        return None
+
     def discard(self, tags: tuple[str, ...]) -> None:
         """Discard selected tagged allocations without preserving contents."""
         raise RuntimeError(
@@ -85,6 +110,13 @@ class SleepModeBackend(ABC):
     @classmethod
     def is_supported(cls) -> bool:
         """Whether this backend can run on the current platform/driver."""
+        return True
+
+    @classmethod
+    def requires_cumem_allocator(cls) -> bool:
+        """If True, enabling sleep mode with this backend enables the cumem
+        allocator. A backend that places memory through
+        ``allocation_context`` itself can return False."""
         return True
 
     @classmethod
@@ -201,6 +233,15 @@ class SleepModeBackendFactory:
                 f"Registered backends: {available}."
             )
         return cls._registry[name]()
+
+    @classmethod
+    def requires_cumem_allocator(cls, name: str) -> bool:
+        """Whether the backend registered as ``name`` needs the cumem
+        allocator. Unknown names (e.g. a plugin backend that has not been
+        registered yet) conservatively return True."""
+        if name not in cls._registry:
+            return True
+        return cls.get_backend_class(name).requires_cumem_allocator()
 
     @classmethod
     def create_backend(cls, model_config: ModelConfig) -> SleepModeBackend:

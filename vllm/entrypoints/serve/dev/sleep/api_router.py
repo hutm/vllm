@@ -28,9 +28,10 @@ async def sleep(
     raw_request: Request,
     level: Annotated[int, Query(ge=0, le=2)] = 1,
     mode: Annotated[PauseMode, Query()] = "abort",
+    clear_cache: Annotated[bool | None, Query()] = None,
 ) -> JSONResponse:
     with sleep_mode_operation_metrics().record("sleep"):
-        await engine_client(raw_request).sleep(level, mode)
+        await engine_client(raw_request).sleep(level, mode, clear_cache)
     return JSONResponse(content={"status": "sleeping", "level": level})
 
 

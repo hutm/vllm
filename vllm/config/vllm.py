@@ -719,17 +719,29 @@ class VllmConfig:
     @property
     def use_cumem_cudagraph_pool(self) -> bool:
         """Whether CUDA graphs go to the cuMem pool that sleep offloads."""
+        from vllm.device_allocator.sleep_mode_backend import (
+            CuMemBackend,
+            SleepModeBackendFactory,
+        )
         from vllm.platforms import current_platform
 
         model_config = self.model_config
-        return (
+        if not (
             model_config is not None
             and model_config.sleep_mode_offload_cudagraph
             and model_config.enable_sleep_mode
-            and model_config.sleep_mode_backend == "cumem"
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and current_platform.is_cuda_alike()
-        )
+        ):
+            return False
+        # Any cuMem-based backend (e.g. cumem_offload_kv) offloads this pool.
+        try:
+            backend_cls = SleepModeBackendFactory.get_backend_class(
+                model_config.sleep_mode_backend
+            )
+        except ValueError:
+            return False
+        return issubclass(backend_cls, CuMemBackend)
 
     @property
     def use_v2_model_runner(self) -> bool:

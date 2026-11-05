@@ -168,17 +168,22 @@ class CuMemBackend(SleepModeBackend):
     are allocated outside the allocator pool).
     """
 
-    def suspend(self, level: int = 1) -> None:
-        from vllm.device_allocator import get_mem_allocator_instance
-
-        self._state = "SUSPENDED"
-        allocator = get_mem_allocator_instance()
+    def offload_tags(self, level: int) -> tuple[str, ...]:
+        """Tagged allocations copied to host memory by ``suspend(level)``;
+        every other allocation is discarded."""
         # Runtime state and graph pools are kept at every level; weights only
         # at level 1.
         offload_tags: tuple[str, ...] = ("runtime", "cudagraph")
         if level == 1:
             offload_tags = ("weights", *offload_tags)
-        allocator.sleep(offload_tags=offload_tags)
+        return offload_tags
+
+    def suspend(self, level: int = 1) -> None:
+        from vllm.device_allocator import get_mem_allocator_instance
+
+        self._state = "SUSPENDED"
+        allocator = get_mem_allocator_instance()
+        allocator.sleep(offload_tags=self.offload_tags(level))
 
     def resume(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
@@ -199,6 +204,27 @@ class CuMemBackend(SleepModeBackend):
     def preserves_communicators(cls) -> bool:
         # Comm identity/topology survive memory suspension; no reinit needed.
         return True
+
+
+class CuMemOffloadKVBackend(CuMemBackend):
+    """``cumem`` that also keeps the KV cache across level-1 sleep.
+
+    Level 1 offloads the KV cache to host memory next to the weights and
+    restores it on resume, so the engine keeps its prefix cache: requests
+    after wake-up reuse cached prefixes instead of recomputing them. This
+    costs host memory equal to the KV cache. Level 2 discards the KV cache
+    as with ``cumem``.
+    """
+
+    def offload_tags(self, level: int) -> tuple[str, ...]:
+        tags = super().offload_tags(level)
+        if level == 1:
+            tags = ("kv_cache", *tags)
+        return tags
+
+    @classmethod
+    def preserves_kv_cache(cls, level: int = 1) -> bool:
+        return level == 1
 
 
 class SleepModeBackendFactory:
@@ -264,4 +290,9 @@ SleepModeBackendFactory.register_backend(
     "cumem",
     "vllm.device_allocator.sleep_mode_backend",
     "CuMemBackend",
+)
+SleepModeBackendFactory.register_backend(
+    "cumem_offload_kv",
+    "vllm.device_allocator.sleep_mode_backend",
+    "CuMemOffloadKVBackend",
 )

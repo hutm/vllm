@@ -997,6 +997,10 @@ class EngineCore:
             if clear_cache:
                 self._reset_caches()
                 self._set_kv_cache_reclaimable(True)
+            kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+            block_pool = getattr(kv_cache_manager, "block_pool", None)
+            if block_pool is not None:
+                block_pool.on_scheduler_paused()
             if preparing:
                 self.release_kv_cache_memory()
                 self.collective_rpc("checkpoint_prepare")
